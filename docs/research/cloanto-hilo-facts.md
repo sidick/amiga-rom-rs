@@ -331,3 +331,14 @@ and `rom.key` at `~/kicksmash32/cloanto_roms/`. Steps run:
   Confidence: CONFIRMED for "this variant exists and is common",
   UNRESOLVED for "is it the only/dominant convention across all real
   burner software".
+
+## Addendum (milestone-2 harness work): romtool's `-k` quirk
+
+Observed black-box while building the differential harness: amitools
+0.8.1's `romtool info -k <path>` does **not** honor the given key path
+for a Cloanto-magic image — it looks for a file literally named
+`rom.key` in the same directory as the ROM file. The harness works
+around it by staging ROM + `rom.key` in one temp dir
+(`tests/differential.rs`, `TempRomDir`). Worth remembering when the
+CLI crate mirrors the `-k` flag: mirror the *documented* behaviour
+(honor the path), not the quirk.

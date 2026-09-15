@@ -328,7 +328,7 @@ Ordered so each item's tests exist before or with it.
       "ours-is-stricter" rather than expecting equality on corrupt
       images; `is_kick` itself still agrees, which is the check that
       matters.
-- [ ] **`RomInfo` + differential oracle.** `info()` aggregate;
+- [x] **`RomInfo` + differential oracle.** `info()` aggregate;
       env-gated `AMIGA_ROM_DIFFERENTIAL=1` test comparing field-for-
       field against pinned amitools `romtool info` over the synthetic
       fixtures (valid, wrong-size, corrupted-checksum, no-footer …),
@@ -356,7 +356,7 @@ Ordered so each item's tests exist before or with it.
       is distinguishable"; `Display` for all, `std::error::Error`
       under the feature — already the convention, re-checked once
       the real variants exist.
-- [ ] **Fuzzing starts here, not later.** `cargo-fuzz` target:
+- [x] **Fuzzing starts here, not later.** `cargo-fuzz` target:
       arbitrary bytes → `Loader::detect`, `Loader::normalize` (with
       and without a key), `KickRom::info` — must never panic, never
       overflow, never allocate absurdly. The rdb crate found two
@@ -462,19 +462,19 @@ reality up top: the crate defines the *interfaces*, users supply the
 
 ## Cross-cutting
 
-- [ ] **Panic policy**: after milestone 2, no public entry point may
+- [x] **Panic policy**: after milestone 2, no public entry point may
       panic on any input (`todo!()` stubs are the documented,
       temporary exception and each names its milestone). Enforced by
       the fuzz targets plus explicit hostile-input unit tests per
       check.
-- [ ] **CI** (GitHub Actions), cloned from the rdb crate's shape:
+- [x] **CI** (GitHub Actions), cloned from the rdb crate's shape:
       stable test, `--no-default-features` build+test, clippy
       `-D warnings`, `fmt --check`, `RUSTDOCFLAGS="-D warnings"
       doc`, MSRV 1.63 job, amitools differential job (pins the
       version), 60-second fuzz smoke once the fuzz target exists.
 - [ ] **`#![deny(missing_docs)]`** once milestone 2's API-shape
       audit settles signatures (before publish).
-- [ ] **Real-ROM harness**: the `AMIGA_ROM_DIR` env-gated test
+- [x] **Real-ROM harness**: the `AMIGA_ROM_DIR` env-gated test
       module (skips silently when unset), asserting known facts
       about known ROMs by KickSum. Local-only, never CI.
 - [ ] **crates.io**: reserve/publish `amiga-rom` 0.2.0 at end of

@@ -409,9 +409,24 @@ involved), run over every `*.rom`/`*.bin` in the directory; images
 without the JMP header (A4091/A590/Picasso IV expansion ROMs, CD32 FMV
 module) skipped as expected non-Kickstart formats.
 
-One more §4 datapoint from milestone-2 review: kickety-split is
-variant-specific even within one OS release — the A500-class 2.04 ROM
-(`amiga-os-204.rom`) has `1111 4EF9` at its midpoint (romtool:
-`kickety_split ok`) while the A3000 2.04 build does not (`NOK`), both
-`is_kick ok`. Confirms "whatever bytes sit at that build's midpoint",
-per-machine-build, not per-release.
+More §4 data from milestone-2 review — a full midpoint-signature sweep
+of the 512 KiB images in the local collection refines the distribution
+question left PROBABLE in §4. Presence of `1111 4EF9` at the midpoint:
+
+- **2.0x era: tracks the machine's ROM interface width.** 2.04
+  (A500-class) and 2.05 (A600) have it; 2.04 A3000 does not.
+- **3.0: same pattern** — A1200 has it, A4000 does not — consistent
+  with the width rule given that kicksmash32's docs group the A1200
+  with the 16-bit-format machines (`-s 1032`, hedged "likely").
+- **3.1 (40.6x): unconditional.** Every machine build sampled has it —
+  A600, A1200, A3000, A4000, A4000T — including unambiguously
+  32-bit-bus machines, so bus width stops predicting here.
+- **Post-Commodore: none.** 3.1.4 (46.143), 3.X (45.64), 3.2
+  (46/47.x), CD32, Walker 43.1, AROS all lack it.
+
+Best-fit characterization: in the 2.0x–3.0 era the midpoint header was
+emitted for 16-bit-ROM-interface targets; the 3.1 (40.x) build emitted
+it for every target; Hyperion-era builds dropped it. Still
+informational-only for `is_kick`; recorded here because it turns §4's
+"whatever bytes happen to sit at the midpoint" into an actual rule of
+thumb for interpreting the flag on real ROMs.

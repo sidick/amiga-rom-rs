@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Zero dependencies, so there is nothing to vendor and nothing to break.
+  CARGO_NET_RETRY: 10
+
+jobs:
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      # --all-targets skips doctests; run them too, they are part of the docs.
+      - run: cargo test --doc
+
+  no-std:
+    name: build --no-default-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The crate is no_std + alloc without the `std` feature; this job is the
+      # only thing standing between that claim and it quietly becoming false.
+      - run: cargo build --no-default-features
+      # And the tests, over every target: the `std`-only items (Error impls)
+      # are `#[cfg]`-ed out of the suite.
+      - run: cargo test --no-default-features --all-targets
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+
+  msrv:
+    # Keep in step with `rust-version` in Cargo.toml; the two are one decision.
+    name: msrv (1.63)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.63
+      - uses: Swatinem/rust-cache@v2
+      # Test + build only. clippy and rustfmt drift lint-for-lint between
+      # releases, so pinning their opinions to an old toolchain buys nothing;
+      # they run on stable above.
+      - run: cargo test
+      - run: cargo build --no-default-features
+
+  fuzz:
+    # A smoke run, not a campaign: 60 seconds over the committed seed corpus
+    # is enough to catch a panic a change just introduced on a shape the
+    # corpus already reaches, and cheap enough to run on every push. It
+    # is a normal, blocking job — a panic in the loader or KickRom's checks
+    # is a bug whether the fuzzer or a user found it. Deeper runs happen
+    # out of band; this is the regression net.
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # cargo-fuzz needs nightly: the sanitizer flags and the
+      # libfuzzer-sys glue are nightly-only.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # `-runs` is not capped, so `-max_total_time` is the whole budget;
+      # `-max_len` keeps inputs modest rather than multi-megabyte.
+      # Run from the repo root: cargo-fuzz finds `fuzz/` from here, and
+      # the fuzz crate is its own workspace so nothing else is built.
+      # `fuzz/seeds` is given explicitly because the corpus is not
+      # committed — a plausible boot-vector/header/footer shape is
+      # gated on bytes coverage feedback cannot guess its way to
+      # quickly, so a run from nothing would spend its whole budget
+      # outside the interesting code paths.
+      # The corpus directory has to exist before it can be named; new
+      # inputs accumulate in it for the length of the job and are then
+      # thrown away with the runner.
+      # `--target x86_64-unknown-linux-gnu`: cargo-fuzz's own default on
+      # Linux is the musl triple (a statically-linked libc), and ASan
+      # refuses to link against one at all ("sanitizer is incompatible
+      # with statically linked libc"). glibc is what the runner already
+      # has, so this is the target that actually builds.
+      - run: |
+          mkdir -p fuzz/corpus/parse
+          cargo fuzz run --target x86_64-unknown-linux-gnu parse \
+            fuzz/corpus/parse fuzz/seeds \
+            -- -max_total_time=60 -max_len=65536
+
+  differential:
+    # The oracle suite: build synthetic images here and let amitools'
+    # `romtool` inspect them, comparing its `info` output field-for-field
+    # against this crate's `KickRom::info()`. Pinned to 0.8.1 because that
+    # is the exact version the header/footer facts in
+    # docs/research/header-footer-facts.md were oracle-verified against,
+    # and a differential against a moving oracle tests nothing. No real ROM
+    # bytes are needed — romtool is happy to inspect a synthetic image —
+    # so this job needs no ROM fixtures. amitools is GPL: it is run here,
+    # never copied.
+    name: differential (amitools 0.8.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # python3 and pip are preinstalled on the runners; --user keeps it out
+      # of the system site-packages and needs no virtualenv dance.
+      - run: pip install --user amitools==0.8.1
+      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: romtool --help > /dev/null
+      # The differential tests are gated on this variable: without it they
+      # return immediately, which is why the rest of CI needs no amitools.
+      - run: cargo test --test differential
+        env:
+          AMIGA_ROM_DIFFERENTIAL: "1"
