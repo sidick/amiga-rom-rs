@@ -378,11 +378,39 @@ split-by-module work stands on. (`exec_rev` turned out *not* to live
 here — milestone 1 proved it's a fixed header read, so it ships with
 milestone 2.)
 
-- [ ] **`Resident` layout from the NDK** (`exec/resident.h` — struct
-      layout as fact): `RTC_MATCHWORD` (0x4AFC), `rt_MatchTag`
-      self-pointer, `rt_EndSkip`, `rt_Flags`, `rt_Version`,
-      `rt_Type`, `rt_Pri`, `rt_Name`, `rt_IdString`, `rt_Init`.
-      Documented here with offsets once transcribed.
+- [x] **`Resident` layout from the NDK.** CONFIRMED — transcribed
+      directly from `exec/resident.h` (NDK 3.2 R4, Hyperion/Commodore,
+      permissively available for exact quotation — no oracle needed,
+      this is a struct-layout fact, not an empirical one) and
+      `exec/nodes.h`. m68k structs pack tight at natural (word/byte)
+      alignment, no compiler padding — every multi-byte field below
+      lands on an even offset with zero gaps, so `sizeof(Resident) ==
+      0x1A` (26 bytes) exactly:
+
+      | Offset | Width | Field | Notes |
+      |---|---|---|---|
+      | 0x00 | u16 | `rt_MatchWord` | must equal `RTC_MATCHWORD = 0x4AFC` (the 68000 `ILLEGAL` opcode — deliberately a trap if ever executed) |
+      | 0x02 | u32 (APTR) | `rt_MatchTag` | self-pointer: must equal this struct's own *absolute ROM address* (offset 0x00 of this same structure) |
+      | 0x06 | u32 (APTR) | `rt_EndSkip` | absolute address to resume scanning after this module |
+      | 0x0A | u8 | `rt_Flags` | `RTF_AUTOINIT` (bit 7, `0x80`): `rt_Init` points to an auto-init data structure, not code, directly relevant to this crate since dereferencing it differently changes what `rt_Init` means; `RTF_AFTERDOS` (bit 2), `RTF_SINGLETASK` (bit 1), `RTF_COLDSTART` (bit 0) — not needed for a scanner, recorded for completeness |
+      | 0x0B | u8 | `rt_Version` | release version number (single byte — coarser than the header's `rom_rev`/`exec_rev` pairs) |
+      | 0x0C | u8 | `rt_Type` | `NT_LIBRARY=9`, `NT_DEVICE=3`, `NT_RESOURCE=8`, `NT_PROCESS=13`, plus the full `NT_*` set from `nodes.h` (0=UNKNOWN..19=DEATHMESSAGE, 254=USER, 255=EXTENDED) |
+      | 0x0D | i8 | `rt_Pri` | signed initialization priority |
+      | 0x0E | u32 (char*) | `rt_Name` | absolute pointer to a NUL-terminated name string in ROM |
+      | 0x12 | u32 (char*) | `rt_IdString` | absolute pointer to a NUL-terminated ID string in ROM |
+      | 0x16 | u32 (APTR) | `rt_Init` | meaning gated by `RTF_AUTOINIT`: plain init-code pointer when clear, auto-init table pointer when set |
+
+      **Pointer translation, the load-bearing consequence for
+      `ResidentScan`**: every pointer field (`rt_MatchTag`,
+      `rt_EndSkip`, `rt_Name`, `rt_IdString`, `rt_Init`) is an
+      *absolute Amiga address*, not a file offset — exactly the
+      `base_addr` (milestone 2) translation problem the milestone-3
+      item below already anticipates. `rt_MatchTag == this_struct_addr`
+      is therefore the validity check: compute the candidate's own
+      absolute address as `base_addr + candidate_offset`, and require
+      the stored `rt_MatchTag` value to equal it exactly — a strong
+      self-consistency check with no separate "known good" table
+      needed, unlike the header signature problem in milestone 1.
 - [ ] **`ResidentScan`**: iterate matchwords over the image,
       validate each candidate's `rt_MatchTag` points back at itself
       (ROM-address-space aware: pointers are absolute addresses in
