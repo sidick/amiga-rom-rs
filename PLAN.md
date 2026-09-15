@@ -495,7 +495,21 @@ Design decisions from that session, each with its reasoning:
   (`&'a [u8]` per module), consistent with `KickRom`'s and
   `ResidentScan`'s existing allocation-free convention. A caller
   wanting an owned `Vec<u8>` per module calls `.to_vec()` themselves.
-- [ ] **Implement per the above** once picked back up.
+- [x] **Implement per the above.** `ModuleSpec<'a>{name, offset,
+      length}`, `Module<'a>{name, data}`, `SplitError::ModuleOutOfBounds
+      {index, offset, length, rom_len}` (single variant — one failure
+      mode, per the no-premature-abstraction convention), and
+      `split<'a>(rom: &'a [u8], modules: &[ModuleSpec<'a>]) ->
+      Result<Vec<Module<'a>>, SplitError>`. `checked_add` guards the
+      offset+length bounds check against `usize` overflow; fail-fast
+      (first out-of-bounds spec aborts the whole call, no partial
+      `Vec`); zero-length modules and overlapping ranges both succeed
+      (overlap detection is explicitly out of scope). Added to the fuzz
+      target with offsets/lengths derived from the input bytes so the
+      bounds-check path (including the overflow guard) is actually
+      exercised. 58 unit tests (was 51); verified against the real
+      1.63.0 toolchain, not just stable, after the MSRV break earlier
+      this session.
 - [ ] **`list`/`query`/`build` deferred** — not part of this milestone;
       revisit once `split` is proven and the hunk-parsing/relocation
       scope decision (implement inline vs depend on a crate) is

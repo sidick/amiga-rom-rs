@@ -1,7 +1,7 @@
 //! Fuzz every entry point that takes attacker-controlled bytes directly:
 //! [`Loader::detect`]/[`Loader::normalize`], [`KickRom`]'s checks/`info()`,
-//! [`merge_hi_lo`]/[`split_hi_lo`], and [`seal_checksum`]/
-//! [`verify_check_sum`].
+//! [`merge_hi_lo`]/[`split_hi_lo`], [`seal_checksum`]/
+//! [`verify_check_sum`], and [`split`].
 //!
 //! Every one of these is documented to never panic on any input — bounds
 //! are checked, not assumed — so the only property under test is "no
@@ -39,15 +39,67 @@
 //! * `seal_checksum` on a mutable copy, followed by `verify_check_sum` —
 //!   the one property that *is* asserted rather than discarded: sealing
 //!   that reports `Ok` must make the checksum verify.
+//! * `split(data, &modules)` — a handful of `ModuleSpec`s whose
+//!   `offset`/`length` are derived deterministically from the input
+//!   bytes themselves (see `module_specs_from_input` below), so absurd
+//!   offsets, absurd lengths, and offset+length pairs that overflow
+//!   `usize` are all actually exercised against `split`'s bounds-check,
+//!   not just a fixed empty/trivial `modules` slice.
 #![no_main]
 
-use amiga_rom::{merge_hi_lo, seal_checksum, split_hi_lo, KickRom, Loader};
+use amiga_rom::{merge_hi_lo, seal_checksum, split, split_hi_lo, KickRom, Loader, ModuleSpec};
 use libfuzzer_sys::fuzz_target;
 
 /// Short, fixed Cloanto key — real `rom.key` files are a handful of
 /// bytes, and a short cycling key stresses `decode_cloanto`'s modulo
 /// indexing more than a long one would.
 const FIXED_KEY: &[u8] = b"fuzzkey!";
+
+/// Reads an 8-byte little-endian `usize` out of `data` starting at
+/// `at`, or `0` if `data` is too short there — never panics.
+fn usize_at(data: &[u8], at: usize) -> usize {
+    let mut buf = [0u8; 8];
+    if let Some(slice) = data.get(at..).and_then(|s| s.get(..s.len().min(8))) {
+        buf[..slice.len()].copy_from_slice(slice);
+    }
+    u64::from_le_bytes(buf) as usize
+}
+
+/// Derives a few [`ModuleSpec`]s straight from the fuzz input's own
+/// bytes, so `split`'s bounds-checking is exercised against offsets and
+/// lengths that actually vary with the input (in-bounds, out-of-bounds,
+/// zero-length, and `usize`-overflowing) rather than a fixed trivial
+/// slice.
+fn module_specs_from_input(data: &[u8]) -> [ModuleSpec<'static>; 4] {
+    [
+        // Likely in-bounds for small inputs, likely out-of-bounds for
+        // larger/adversarial ones.
+        ModuleSpec {
+            name: "a",
+            offset: usize_at(data, 0),
+            length: usize_at(data, 8),
+        },
+        // Zero-length is always valid, whatever the offset.
+        ModuleSpec {
+            name: "b",
+            offset: usize_at(data, 16),
+            length: 0,
+        },
+        // Deliberately pushed toward usize::MAX so offset+length has a
+        // real chance of overflowing in the checked-add path.
+        ModuleSpec {
+            name: "c",
+            offset: usize::MAX - usize_at(data, 24).min(4),
+            length: usize_at(data, 32),
+        },
+        // Whole-input range, valid whenever data is non-empty.
+        ModuleSpec {
+            name: "d",
+            offset: 0,
+            length: data.len(),
+        },
+    ]
+}
 
 fuzz_target!(|data: &[u8]| {
     // --- Loader::detect ------------------------------------------------
@@ -85,4 +137,8 @@ fuzz_target!(|data: &[u8]| {
             "seal_checksum reported Ok but verify_check_sum failed on the sealed image"
         );
     }
+
+    // --- split: bounds-check derived-from-input module ranges ----------
+    let specs = module_specs_from_input(data);
+    let _ = split(data, &specs);
 });

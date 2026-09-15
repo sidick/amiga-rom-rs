@@ -43,7 +43,11 @@
 //! implemented: [`KickRom::scan`] returns a [`ResidentScan`], an
 //! allocation-free iterator over `Resident` (RomTag) structures found
 //! in the image, matching `romtool scan` parity — see that type's doc
-//! comment for the exact scanning/hostile-input rules.
+//! comment for the exact scanning/hostile-input rules. Milestone 4 is
+//! scoped down to just [`split`]: bounds-checked, borrowed-output
+//! extraction of caller-supplied [`ModuleSpec`] ranges, with no
+//! `ModuleCatalog` trait, no overlap detection, and no catalog-identity
+//! matching — see that function's doc comment.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -932,6 +936,138 @@ impl<'a> Iterator for ResidentScan<'a> {
         }
         None
     }
+}
+
+/// One caller-supplied module range to extract via [`split`]: a name and
+/// a byte range (`offset..offset+length`) into a ROM image.
+///
+/// This is plain, caller-constructed input — never produced by this
+/// crate. Per `PLAN.md`'s "Milestone 4" design, there is deliberately no
+/// `ModuleCatalog` trait here: this crate does zero file I/O, so a
+/// catalog *file format* (how a list of these gets read from disk) is
+/// the CLI crate's concern, not this one's. A `ModuleSpec` carries only
+/// `{name, offset, length}` — no relocation data, no "kind" tag, no
+/// cross-reference to [`ResidentScan`]; scanning and catalog-driven
+/// splitting are unrelated concepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleSpec<'a> {
+    /// The module's name, as given by the catalog this came from.
+    pub name: &'a str,
+    /// Byte offset of the module's start within the ROM image.
+    pub offset: usize,
+    /// Length of the module in bytes.
+    pub length: usize,
+}
+
+/// One module extracted by [`split`]: a name and a borrowed slice of the
+/// source ROM.
+///
+/// `data` borrows directly from the `rom` passed to [`split`] — per
+/// `PLAN.md`'s Milestone 4 decision, `split` never transforms bytes, only
+/// cuts them, matching [`KickRom`]'s and [`ResidentScan`]'s existing
+/// allocation-free convention. A caller wanting an owned `Vec<u8>` calls
+/// `.to_vec()` on `data` themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Module<'a> {
+    /// The module's name, borrowed from the [`ModuleSpec`] it came from.
+    pub name: &'a str,
+    /// The module's bytes: `&rom[offset..offset + length]`.
+    pub data: &'a [u8],
+}
+
+/// Errors from [`split`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitError {
+    /// A [`ModuleSpec`]'s `offset..offset+length` range does not fit
+    /// within the ROM: either the addition overflows `usize` (a hostile
+    /// offset/length pair), or the resulting end exceeds `rom.len()`.
+    /// `index` is this module's position in the `modules` slice passed
+    /// to [`split`] (not its name — kept cheap, no `alloc::string::String`
+    /// needed to report this).
+    ModuleOutOfBounds {
+        /// Index of the offending [`ModuleSpec`] within the `modules`
+        /// slice.
+        index: usize,
+        /// The requested offset.
+        offset: usize,
+        /// The requested length.
+        length: usize,
+        /// The ROM's actual length.
+        rom_len: usize,
+    },
+}
+
+impl fmt::Display for SplitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SplitError::ModuleOutOfBounds {
+                index,
+                offset,
+                length,
+                rom_len,
+            } => {
+                write!(
+                    f,
+                    "module {} at offset {} length {} does not fit within a {}-byte ROM",
+                    index, offset, length, rom_len
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SplitError {}
+
+/// Extracts `modules` from `rom` as borrowed slices, per `PLAN.md`'s
+/// "Milestone 4" design.
+///
+/// For each [`ModuleSpec`] in `modules`, in order, this bounds-checks
+/// `offset..offset+length` against `rom` (a hard safety property, like
+/// every other check in this crate) and either produces a [`Module`]
+/// borrowing that range, or fails. Bounds-checking uses
+/// [`usize::checked_add`] for `offset + length`, so a hostile/absurd
+/// pair (e.g. `offset: usize::MAX, length: 1`) reports
+/// [`SplitError::ModuleOutOfBounds`] rather than panicking on overflow.
+/// A `length` of `0` is valid and yields an empty slice, not an error.
+///
+/// This is fail-fast, matching the return type
+/// `Result<Vec<Module>, SplitError>`: the first out-of-bounds module
+/// aborts the whole call with `Err` and no `Vec` is returned at all —
+/// there is no partial-success mode where modules before the failure are
+/// still handed back. An empty `modules` slice yields `Ok(vec![])`.
+///
+/// Per `PLAN.md`, this deliberately does **not** detect overlapping
+/// module ranges (two specs claiming the same bytes is a complaint about
+/// the catalog's own consistency, not a memory-safety concern — out of
+/// scope), and has no opinion on whether `modules` "belongs" to `rom`
+/// (matching a catalog to a ROM, e.g. by KickSum, is a lookup step for
+/// the caller, entirely outside this crate).
+///
+/// # Errors
+///
+/// [`SplitError::ModuleOutOfBounds`] identifying the first (by index)
+/// [`ModuleSpec`] whose range does not fit within `rom`.
+pub fn split<'a>(rom: &'a [u8], modules: &[ModuleSpec<'a>]) -> Result<Vec<Module<'a>>, SplitError> {
+    let mut out = Vec::with_capacity(modules.len());
+    for (index, spec) in modules.iter().enumerate() {
+        let end = match spec.offset.checked_add(spec.length) {
+            Some(end) if end <= rom.len() => end,
+            _ => {
+                return Err(SplitError::ModuleOutOfBounds {
+                    index,
+                    offset: spec.offset,
+                    length: spec.length,
+                    rom_len: rom.len(),
+                })
+            }
+        };
+        out.push(Module {
+            name: spec.name,
+            data: &rom[spec.offset..end],
+        });
+    }
+    Ok(out)
 }
 
 /// Test-only synthetic Kickstart image fixtures — never ships real ROM
@@ -1923,5 +2059,152 @@ mod scan_tests {
         // structurally-valid-looking matchword scan yields nothing.
         let short = vec![0u8; 10];
         assert_eq!(KickRom::new(&short).scan().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn empty_modules_yields_empty_vec() {
+        let rom = vec![0u8; 16];
+        assert_eq!(split(&rom, &[]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn one_valid_module_in_bounds() {
+        let rom: Vec<u8> = (0..16u8).collect();
+        let specs = [ModuleSpec {
+            name: "mod0",
+            offset: 4,
+            length: 4,
+        }];
+        let modules = split(&rom, &specs).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "mod0");
+        assert_eq!(modules[0].data, &rom[4..8]);
+    }
+
+    #[test]
+    fn multiple_modules_including_adjacent_and_overlapping() {
+        let rom: Vec<u8> = (0..32u8).collect();
+        let specs = [
+            ModuleSpec {
+                name: "a",
+                offset: 0,
+                length: 8,
+            },
+            // Adjacent to "a".
+            ModuleSpec {
+                name: "b",
+                offset: 8,
+                length: 8,
+            },
+            // Deliberately overlaps "b" — overlap detection is out of
+            // scope per PLAN.md, so this must succeed, not error.
+            ModuleSpec {
+                name: "c",
+                offset: 12,
+                length: 8,
+            },
+        ];
+        let modules = split(&rom, &specs).unwrap();
+        assert_eq!(modules.len(), 3);
+        assert_eq!(modules[0].name, "a");
+        assert_eq!(modules[0].data, &rom[0..8]);
+        assert_eq!(modules[1].name, "b");
+        assert_eq!(modules[1].data, &rom[8..16]);
+        assert_eq!(modules[2].name, "c");
+        assert_eq!(modules[2].data, &rom[12..20]);
+    }
+
+    #[test]
+    fn out_of_bounds_module_fails_fast_with_no_partial_success() {
+        let rom = vec![0u8; 16];
+        let specs = [
+            ModuleSpec {
+                name: "ok",
+                offset: 0,
+                length: 4,
+            },
+            ModuleSpec {
+                name: "too-long",
+                offset: 10,
+                length: 100,
+            },
+            ModuleSpec {
+                name: "never-reached",
+                offset: 0,
+                length: 1,
+            },
+        ];
+        // Fail-fast: the whole call is Err, full stop — no Vec with the
+        // valid "ok" module is returned, and "never-reached" is simply
+        // never inspected (its own out-of-bounds-ness, if any, wouldn't
+        // matter here since index 1 already fails first).
+        assert_eq!(
+            split(&rom, &specs),
+            Err(SplitError::ModuleOutOfBounds {
+                index: 1,
+                offset: 10,
+                length: 100,
+                rom_len: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_length_module_succeeds_with_empty_slice() {
+        let rom = vec![0u8; 16];
+        let specs = [ModuleSpec {
+            name: "empty",
+            offset: 8,
+            length: 0,
+        }];
+        let modules = split(&rom, &specs).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].data, &[] as &[u8]);
+    }
+
+    #[test]
+    fn offset_length_overflow_errors_instead_of_panicking() {
+        let rom = vec![0u8; 16];
+        let specs = [ModuleSpec {
+            name: "overflow",
+            offset: usize::MAX,
+            length: 1,
+        }];
+        assert_eq!(
+            split(&rom, &specs),
+            Err(SplitError::ModuleOutOfBounds {
+                index: 0,
+                offset: usize::MAX,
+                length: 1,
+                rom_len: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_length_rom_with_zero_length_specs_succeeds() {
+        let rom: Vec<u8> = vec![];
+        let specs = [
+            ModuleSpec {
+                name: "a",
+                offset: 0,
+                length: 0,
+            },
+            ModuleSpec {
+                name: "b",
+                offset: 0,
+                length: 0,
+            },
+        ];
+        let modules = split(&rom, &specs).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert_eq!(modules[0].data, &[] as &[u8]);
+        assert_eq!(modules[1].data, &[] as &[u8]);
     }
 }
