@@ -39,7 +39,11 @@
 //! byte-order detection/reordering over the confirmed signature table,
 //! Cloanto decode, and the hi/lo EPROM word-interleave. No `todo!()`
 //! remains; the differential-oracle harness and fuzzing are the
-//! outstanding milestone-2 items.
+//! outstanding milestone-2 items. Milestone 3's `scan` step is also
+//! implemented: [`KickRom::scan`] returns a [`ResidentScan`], an
+//! allocation-free iterator over `Resident` (RomTag) structures found
+//! in the image, matching `romtool scan` parity — see that type's doc
+//! comment for the exact scanning/hostile-input rules.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -606,6 +610,23 @@ impl<'a> KickRom<'a> {
         ))
     }
 
+    /// Scans the image for `Resident` (RomTag) structures, `romtool
+    /// scan`-style. See [`ResidentScan`]'s doc comment for the full
+    /// algorithm and hostile-input rules.
+    ///
+    /// The self-pointer validity check (`rt_MatchTag == base_addr +
+    /// offset`) needs a known [`KickRom::base_addr`] to mean anything; if
+    /// that's `None` (image shorter than 0x18 bytes), the returned
+    /// iterator yields nothing rather than skip the check — a matchword
+    /// found without a way to validate it is not a confirmed hit.
+    pub fn scan(&self) -> ResidentScan<'a> {
+        ResidentScan {
+            data: self.data,
+            base_addr: self.base_addr(),
+            pos: 0,
+        }
+    }
+
     /// Aggregates every check/value into one [`RomInfo`], matching
     /// `romtool info`'s field set.
     pub fn info(&self) -> RomInfo {
@@ -698,6 +719,219 @@ pub struct RomInfo {
     pub boot_pc: Option<u32>,
     pub rom_rev: Option<(u16, u16)>,
     pub exec_rev: Option<(u16, u16)>,
+}
+
+/// The 68000 "ILLEGAL" instruction word every `Resident` structure
+/// begins with (`exec/resident.h`'s `RTC_MATCHWORD`, NDK-confirmed).
+const RTC_MATCHWORD: u16 = 0x4AFC;
+
+/// Byte length of a `struct Resident` on m68k: ten fields, no padding
+/// (a `UWORD` then nine `ULONG`/`APTR`/byte-sized fields, all naturally
+/// aligned on m68k's 2-byte minimum alignment) — `2 + 4 + 4 + 1 + 1 + 1
+/// + 1 + 4 + 4 + 4 == 26`. NDK-confirmed against `exec/resident.h`.
+const RESIDENT_STRUCT_LEN: usize = 26;
+
+/// Longest run searched for a NUL terminator when resolving a
+/// `rt_Name`/`rt_IdString` pointer, so a corrupt/missing NUL can't walk
+/// the scan to the end of a huge image. Real Amiga strings here are a
+/// handful of bytes (module and library names); 256 is generous.
+const RESIDENT_STRING_SEARCH_CAP: usize = 256;
+
+/// A borrowed view over one `Resident` (RomTag) structure found by
+/// [`KickRom::scan`], laid out per `exec/resident.h` (NDK-confirmed;
+/// field order and byte offsets from the struct's start):
+///
+/// | offset | field           | type                |
+/// |-------:|-----------------|----------------------|
+/// | 0x00   | `rt_MatchWord`  | `UWORD` (`match_word`) |
+/// | 0x02   | `rt_MatchTag`   | `APTR` self-pointer (validated, not stored) |
+/// | 0x06   | `rt_EndSkip`    | `APTR` (`end_skip`) |
+/// | 0x0A   | `rt_Flags`      | `UBYTE` (`flags`) |
+/// | 0x0B   | `rt_Version`    | `UBYTE` (`version`) |
+/// | 0x0C   | `rt_Type`       | `UBYTE` (`node_type`) |
+/// | 0x0D   | `rt_Pri`        | `BYTE` (`priority`) |
+/// | 0x0E   | `rt_Name`       | `char *` (`name`, resolved) |
+/// | 0x12   | `rt_IdString`   | `char *` (`id_string`, resolved) |
+/// | 0x16   | `rt_Init`       | `APTR` (`init_addr`) |
+///
+/// `name`/`id_string` are raw `&[u8]`, NUL-terminated in ROM but *not*
+/// guaranteed valid UTF-8 — this crate never claims `&str` for bytes it
+/// hasn't validated. Callers wanting a display string should use
+/// `String::from_utf8_lossy(resident.name)` (or `.id_string`). Either
+/// field is an empty slice when its pointer couldn't be resolved to an
+/// in-bounds, NUL-terminated run within
+/// [`KickRom::scan`]'s search cap — never a panic, never a guess.
+///
+/// `offset` is where this structure's `rt_MatchWord` was found in the
+/// image (not an NDK field — added for caller convenience, e.g. to
+/// report a hit's location). `end_skip` is the raw `rt_EndSkip` value
+/// as stored in the ROM: [`ResidentScan`] never dereferences or trusts
+/// it for scan control flow (see that type's doc comment), so a
+/// corrupt or backwards value here is reported as-is and is the
+/// caller's problem if they choose to use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resident<'a> {
+    pub match_word: u16,
+    pub flags: u8,
+    pub version: u8,
+    pub node_type: u8,
+    pub priority: i8,
+    pub name: &'a [u8],
+    pub id_string: &'a [u8],
+    pub init_addr: u32,
+    pub offset: usize,
+    pub end_skip: u32,
+}
+
+/// Resolves a `rt_Name`/`rt_IdString`-style pointer (an absolute
+/// ROM-space address) to a borrowed, NUL-terminated (NUL excluded)
+/// slice of `data`.
+///
+/// Returns an empty slice — never panics, never scans past
+/// `RESIDENT_STRING_SEARCH_CAP` (256) bytes — when: `ptr` translates (via
+/// `ptr - base_addr`) to an offset at or past `data.len()` (this also
+/// naturally rejects `ptr < base_addr`, since the wrapping subtraction
+/// underflows to a huge offset); or no NUL byte is found within the
+/// capped search window.
+fn resolve_resident_str(data: &[u8], base_addr: u32, ptr: u32) -> &[u8] {
+    let start = ptr.wrapping_sub(base_addr) as usize;
+    if start >= data.len() {
+        return &[];
+    }
+    let cap = RESIDENT_STRING_SEARCH_CAP.min(data.len() - start);
+    let window = &data[start..start + cap];
+    match window.iter().position(|&b| b == 0) {
+        Some(nul_at) => &window[..nul_at],
+        None => &[],
+    }
+}
+
+/// Allocation-free iterator over [`Resident`] structures found in a
+/// [`KickRom`] image, returned by [`KickRom::scan`] (`romtool scan`
+/// parity).
+///
+/// # Algorithm
+///
+/// Every 2-byte-aligned offset in the image is inspected for
+/// `RTC_MATCHWORD` — m68k instructions (and so `rt_MatchWord`, the
+/// 68000 `ILLEGAL` opcode) only ever land on even offsets, so odd
+/// offsets are never checked. At each matchword, if the remaining 24
+/// bytes of a `struct Resident` (`RESIDENT_STRUCT_LEN`, 26 bytes total)
+/// don't fit in the image, the candidate is skipped. Otherwise
+/// `rt_MatchTag` (the `u32` self-pointer at offset+2) must equal
+/// `base_addr + offset` *exactly* — this is the **only** validity gate;
+/// a matchword with any other `rt_MatchTag` is not a resident and
+/// scanning simply continues from the next word. `rt_Name`/`rt_IdString`
+/// pointers on a valid hit are resolved via `resolve_resident_str`
+/// (bounds-checked, capped NUL search, never a panic).
+///
+/// After a match (valid or not), scanning always continues from the
+/// *next word* (`offset + 2`) — **never** by jumping via `rt_EndSkip`.
+/// A hostile or corrupt `rt_EndSkip` (pointing backwards, out of
+/// bounds, or anywhere at all) is therefore incapable of affecting scan
+/// control flow; it is surfaced on [`Resident::end_skip`] as raw data
+/// for the caller, never dereferenced by this scanner. This is a
+/// deliberate deviation from following the ROM's own module-chaining
+/// convention, in favor of hostile-input robustness.
+///
+/// # Termination
+///
+/// `pos` strictly increases by 2 every iteration and the loop stops
+/// once `pos + 2 > data.len()`, so this iterator always terminates,
+/// including on a zero-length or 1-byte image (immediately empty) and
+/// on a matchword at the very last 2 bytes of the image (detected, but
+/// skipped for lacking room for the rest of the struct).
+///
+/// # `base_addr`
+///
+/// The self-pointer check is meaningless without a known
+/// [`KickRom::base_addr`]; when that's `None`, this iterator is
+/// permanently empty (see [`KickRom::scan`]'s doc comment).
+pub struct ResidentScan<'a> {
+    data: &'a [u8],
+    base_addr: Option<u32>,
+    pos: usize,
+}
+
+impl<'a> Iterator for ResidentScan<'a> {
+    type Item = Resident<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let base_addr = self.base_addr?;
+        while self.pos + 2 <= self.data.len() {
+            let offset = self.pos;
+            // Always advance to the next word, regardless of whether
+            // this candidate turns out valid — never re-visits, never
+            // jumps via untrusted struct contents.
+            self.pos += 2;
+
+            let word = u16::from_be_bytes([self.data[offset], self.data[offset + 1]]);
+            if word != RTC_MATCHWORD {
+                continue;
+            }
+            let struct_end = match offset.checked_add(RESIDENT_STRUCT_LEN) {
+                Some(end) if end <= self.data.len() => end,
+                _ => continue,
+            };
+            let match_tag = u32::from_be_bytes([
+                self.data[offset + 2],
+                self.data[offset + 3],
+                self.data[offset + 4],
+                self.data[offset + 5],
+            ]);
+            let expected = base_addr.wrapping_add(offset as u32);
+            if match_tag != expected {
+                continue;
+            }
+
+            let end_skip = u32::from_be_bytes([
+                self.data[offset + 6],
+                self.data[offset + 7],
+                self.data[offset + 8],
+                self.data[offset + 9],
+            ]);
+            let flags = self.data[offset + 10];
+            let version = self.data[offset + 11];
+            let node_type = self.data[offset + 12];
+            let priority = self.data[offset + 13] as i8;
+            let name_ptr = u32::from_be_bytes([
+                self.data[offset + 14],
+                self.data[offset + 15],
+                self.data[offset + 16],
+                self.data[offset + 17],
+            ]);
+            let id_ptr = u32::from_be_bytes([
+                self.data[offset + 18],
+                self.data[offset + 19],
+                self.data[offset + 20],
+                self.data[offset + 21],
+            ]);
+            let init_addr = u32::from_be_bytes([
+                self.data[offset + 22],
+                self.data[offset + 23],
+                self.data[offset + 24],
+                self.data[offset + 25],
+            ]);
+            debug_assert_eq!(struct_end, offset + RESIDENT_STRUCT_LEN);
+
+            let name = resolve_resident_str(self.data, base_addr, name_ptr);
+            let id_string = resolve_resident_str(self.data, base_addr, id_ptr);
+
+            return Some(Resident {
+                match_word: word,
+                flags,
+                version,
+                node_type,
+                priority,
+                name,
+                id_string,
+                init_addr,
+                offset,
+                end_skip,
+            });
+        }
+        None
+    }
 }
 
 /// Test-only synthetic Kickstart image fixtures — never ships real ROM
@@ -1410,5 +1644,284 @@ mod tests {
             seal_checksum(&mut unaligned),
             Err(SealError::NotLongwordAligned)
         );
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::fixtures::{synthetic_rom, RomFixtureParams, DEFAULT_BASE_512K};
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// Writes a 26-byte `struct Resident` into `img` at file offset
+    /// `off`, with `rt_MatchTag` computed as the correct self-pointer
+    /// (`base_addr + off`) so the result validates by default. Tests
+    /// that want an invalid self-pointer overwrite it afterwards.
+    #[allow(clippy::too_many_arguments)]
+    fn write_resident(
+        img: &mut [u8],
+        off: usize,
+        base_addr: u32,
+        flags: u8,
+        version: u8,
+        node_type: u8,
+        priority: i8,
+        name_ptr: u32,
+        id_ptr: u32,
+        init_addr: u32,
+        end_skip: u32,
+    ) {
+        let match_tag = base_addr.wrapping_add(off as u32);
+        img[off..off + 2].copy_from_slice(&RTC_MATCHWORD.to_be_bytes());
+        img[off + 2..off + 6].copy_from_slice(&match_tag.to_be_bytes());
+        img[off + 6..off + 10].copy_from_slice(&end_skip.to_be_bytes());
+        img[off + 10] = flags;
+        img[off + 11] = version;
+        img[off + 12] = node_type;
+        img[off + 13] = priority as u8;
+        img[off + 14..off + 18].copy_from_slice(&name_ptr.to_be_bytes());
+        img[off + 18..off + 22].copy_from_slice(&id_ptr.to_be_bytes());
+        img[off + 22..off + 26].copy_from_slice(&init_addr.to_be_bytes());
+    }
+
+    /// Writes a NUL-terminated byte string into `img` at file offset
+    /// `off`.
+    fn write_cstr(img: &mut [u8], off: usize, s: &[u8]) {
+        img[off..off + s.len()].copy_from_slice(s);
+        img[off + s.len()] = 0;
+    }
+
+    /// A base image large enough to hold residents and their strings
+    /// well clear of the header/footer, with a known `base_addr`.
+    fn base_image() -> Vec<u8> {
+        synthetic_rom(RomFixtureParams::new_512k())
+    }
+
+    #[test]
+    fn finds_one_valid_resident_with_correct_fields() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        let name_off = 0x500;
+        let id_off = 0x520;
+        write_cstr(&mut img, name_off, b"exec.library");
+        write_cstr(&mut img, id_off, b"exec 45.10");
+        let resident_off = 0x300;
+        write_resident(
+            &mut img,
+            resident_off,
+            base,
+            0x80, // RTF_AUTOINIT
+            45,
+            3, // NT_LIBRARY
+            126,
+            base + name_off as u32,
+            base + id_off as u32,
+            base + 0x600,
+            0xDEAD_BEEF, // garbage end_skip, must be reported but not followed
+        );
+
+        let rom = KickRom::new(&img);
+        let hits: Vec<Resident> = rom.scan().collect();
+        assert_eq!(hits.len(), 1, "expected exactly one resident hit");
+        let hit = &hits[0];
+        assert_eq!(hit.match_word, RTC_MATCHWORD);
+        assert_eq!(hit.offset, resident_off);
+        assert_eq!(hit.flags, 0x80);
+        assert_eq!(hit.version, 45);
+        assert_eq!(hit.node_type, 3);
+        assert_eq!(hit.priority, 126);
+        assert_eq!(hit.name, b"exec.library");
+        assert_eq!(hit.id_string, b"exec 45.10");
+        assert_eq!(hit.init_addr, base + 0x600);
+        assert_eq!(hit.end_skip, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn wrong_self_pointer_yields_nothing() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        let off = 0x300;
+        write_resident(&mut img, off, base, 0, 0, 0, 0, 0, 0, 0, 0);
+        // Corrupt the self-pointer after the fact.
+        img[off + 2..off + 6].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+
+        let rom = KickRom::new(&img);
+        assert_eq!(rom.scan().count(), 0);
+    }
+
+    #[test]
+    fn truncated_matchword_at_end_of_image_yields_nothing_no_panic() {
+        let base = DEFAULT_BASE_512K;
+        // Image ends exactly at the matchword, with no room for the
+        // rest of the struct.
+        let mut img = vec![0u8; 0x18 + 2];
+        // Valid header so base_addr() is Some.
+        {
+            let full = synthetic_rom(RomFixtureParams {
+                size: ROM_SIZE_256K,
+                rom_rev: (0, 0),
+                exec_rev: (0, 0),
+                base_addr: base,
+            });
+            img[..0x18].copy_from_slice(&full[..0x18]);
+        }
+        let last = img.len() - 2;
+        img[last..].copy_from_slice(&RTC_MATCHWORD.to_be_bytes());
+
+        let rom = KickRom::new(&img);
+        assert_eq!(rom.scan().count(), 0);
+    }
+
+    #[test]
+    fn two_residents_are_both_found() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        write_cstr(&mut img, 0x500, b"exec.library");
+        write_cstr(&mut img, 0x520, b"graphics.library");
+        write_resident(
+            &mut img,
+            0x300,
+            base,
+            0,
+            1,
+            3,
+            0,
+            base + 0x500,
+            base + 0x500,
+            0,
+            0,
+        );
+        write_resident(
+            &mut img,
+            0x340,
+            base,
+            0,
+            2,
+            3,
+            0,
+            base + 0x520,
+            base + 0x520,
+            0,
+            0,
+        );
+
+        let rom = KickRom::new(&img);
+        let hits: Vec<Resident> = rom.scan().collect();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].offset, 0x300);
+        assert_eq!(hits[0].version, 1);
+        assert_eq!(hits[1].offset, 0x340);
+        assert_eq!(hits[1].version, 2);
+        assert_eq!(hits[0].name, b"exec.library");
+        assert_eq!(hits[1].name, b"graphics.library");
+    }
+
+    #[test]
+    fn out_of_bounds_name_pointer_yields_empty_slice_not_panic() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        let off = 0x300;
+        write_resident(
+            &mut img,
+            off,
+            base,
+            0,
+            0,
+            0,
+            0,
+            0xFFFF_FFFF, // wildly out of bounds
+            base + 0x500,
+            0,
+            0,
+        );
+        write_cstr(&mut img, 0x500, b"id.only");
+
+        let rom = KickRom::new(&img);
+        let hits: Vec<Resident> = rom.scan().collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, &[] as &[u8]);
+        assert_eq!(hits[0].id_string, b"id.only");
+    }
+
+    #[test]
+    fn no_nul_within_cap_yields_empty_slice() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        let off = 0x300;
+        let str_off = 0x500;
+        // Fill far more than the search cap with non-NUL bytes.
+        for b in img[str_off..str_off + 1024].iter_mut() {
+            *b = b'A';
+        }
+        write_resident(
+            &mut img,
+            off,
+            base,
+            0,
+            0,
+            0,
+            0,
+            base + str_off as u32,
+            0,
+            0,
+            0,
+        );
+
+        let rom = KickRom::new(&img);
+        let hits: Vec<Resident> = rom.scan().collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, &[] as &[u8]);
+    }
+
+    #[test]
+    fn zero_length_and_tiny_images_yield_empty_iterator_no_panic() {
+        assert_eq!(KickRom::new(&[]).scan().count(), 0);
+        assert_eq!(KickRom::new(&[0u8]).scan().count(), 0);
+        assert_eq!(KickRom::new(&[0u8; 23]).scan().count(), 0);
+        let matchword_only: [u8; 2] = RTC_MATCHWORD.to_be_bytes();
+        assert_eq!(KickRom::new(&matchword_only).scan().count(), 0);
+    }
+
+    #[test]
+    fn garbage_end_skip_does_not_affect_scan_control_flow() {
+        // Two residents close enough together that a "trust rt_EndSkip"
+        // implementation with a bogus/huge EndSkip on the first would
+        // jump over (and thus miss) the second.
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        write_resident(
+            &mut img,
+            0x300,
+            base,
+            0,
+            1,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0xFFFF_FFFF, // garbage/huge
+        );
+        write_resident(&mut img, 0x330, base, 0, 2, 3, 0, 0, 0, 0, 0);
+
+        let rom = KickRom::new(&img);
+        let hits: Vec<Resident> = rom.scan().collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "EndSkip must not be trusted for scan control flow"
+        );
+        assert_eq!(hits[0].version, 1);
+        assert_eq!(hits[0].end_skip, 0xFFFF_FFFF);
+        assert_eq!(hits[1].version, 2);
+    }
+
+    #[test]
+    fn scan_is_empty_when_base_addr_is_unknown() {
+        // Shorter than 0x18 bytes: base_addr() is None, so even a
+        // structurally-valid-looking matchword scan yields nothing.
+        let short = vec![0u8; 10];
+        assert_eq!(KickRom::new(&short).scan().count(), 0);
     }
 }

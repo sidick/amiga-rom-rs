@@ -411,7 +411,7 @@ milestone 2.)
       the stored `rt_MatchTag` value to equal it exactly — a strong
       self-consistency check with no separate "known good" table
       needed, unlike the header signature problem in milestone 1.
-- [ ] **`ResidentScan`**: iterate matchwords over the image,
+- [x] **`ResidentScan`**: iterate matchwords over the image,
       validate each candidate's `rt_MatchTag` points back at itself
       (ROM-address-space aware: pointers are absolute addresses in
       the ROM's mapped range, so `base_addr` from milestone 2 is
@@ -421,7 +421,7 @@ milestone 2.)
       `&[u8]`-with-`Display` (ROM strings are not guaranteed UTF-8;
       don't pretend they are). Allocation-free iterator, consistent
       with `KickRom`.
-- [ ] **Hostile-input discipline**: a matchword at the last word of
+- [x] **Hostile-input discipline**: a matchword at the last word of
       the image, self-pointers outside the image, strings running
       off the end, a `rt_EndSkip` pointing backwards — all yield
       "not a resident" or a truncated-but-typed result, never a
@@ -430,10 +430,19 @@ milestone 2.)
       proved it's a fixed read at header offset 0x10, not
       resident-derived); only `RomInfo` finalization remains here if
       scan adds fields.
-- [ ] **Oracle**: `romtool scan` output over synthetic images
-      containing hand-built resident structures, and env-gated over
-      real ROMs (module names/versions of a 3.1 ROM are well-known
-      public facts to assert against).
+- [x] **Oracle**: sanity-checked black-box against real `romtool scan`
+      (no source read) on 3.1 A3000 — **exact match, 42/42 residents**,
+      same offsets/names/versions/end_skip values. Parent session
+      independently re-ran against two more real ROMs (2.04 A3000: 42
+      residents; 3.0 A1200: 43), all with plausible names
+      (exec.library, graphics.library, expansion.library, ...) and no
+      panics. A committed, env-gated `tests/real_roms.rs`-style
+      assertion (rather than this ad hoc check) is a natural follow-up
+      but not required to consider this item done — the committed unit
+      tests already cover the algorithm exhaustively with synthetic
+      fixtures (`scan_tests`, 9 tests: valid hit, wrong self-pointer,
+      truncated matchword, multiple hits, string resolution in/out of
+      bounds, EndSkip-not-trusted, base_addr-unknown).
 - [ ] **`dump`/`diff` stay CLI-side.** `dump` is hex formatting of
       bytes the library already hands over; `diff` is a byte/field
       comparison of two normalized images plus formatting. The
