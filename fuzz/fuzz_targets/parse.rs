@@ -1,7 +1,7 @@
 //! Fuzz every entry point that takes attacker-controlled bytes directly:
 //! [`Loader::detect`]/[`Loader::normalize`], [`KickRom`]'s checks/`info()`,
 //! [`merge_hi_lo`]/[`split_hi_lo`], [`seal_checksum`]/
-//! [`verify_check_sum`], and [`split`].
+//! [`verify_check_sum`], [`split`], [`combine`], and [`apply_patches`].
 //!
 //! Every one of these is documented to never panic on any input — bounds
 //! are checked, not assumed — so the only property under test is "no
@@ -45,9 +45,21 @@
 //!   offsets, absurd lengths, and offset+length pairs that overflow
 //!   `usize` are all actually exercised against `split`'s bounds-check,
 //!   not just a fixed empty/trivial `modules` slice.
+//! * `combine(a, b)` — the input split in half (front/back) as the two
+//!   candidate ROM images. Almost all fuzz input fails `combine`'s
+//!   512 KiB + `is_kick_rom` validation, which is fine — the point is
+//!   proving no panic on hostile input of any size/content, not
+//!   reaching the success path every time.
+//! * `apply_patches(&mut copy, &patches)` — a small `Vec<PatchOp>`
+//!   derived from the input's own bytes (see `patches_from_input`
+//!   below), covering in-bounds, out-of-bounds, `usize`-overflowing,
+//!   and mismatched-length patches against a mutable copy of `data`.
 #![no_main]
 
-use amiga_rom::{merge_hi_lo, seal_checksum, split, split_hi_lo, KickRom, Loader, ModuleSpec};
+use amiga_rom::{
+    apply_patches, combine, merge_hi_lo, seal_checksum, split, split_hi_lo, KickRom, Loader,
+    ModuleSpec, PatchOp,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Short, fixed Cloanto key — real `rom.key` files are a handful of
@@ -101,6 +113,52 @@ fn module_specs_from_input(data: &[u8]) -> [ModuleSpec<'static>; 4] {
     ]
 }
 
+/// Derives a few [`PatchOp`]s straight from the fuzz input's own bytes,
+/// so `apply_patches`' bounds-checking and expected/replacement-length
+/// checks are exercised against offsets and lengths that actually vary
+/// with the input, same spirit as `module_specs_from_input` above.
+///
+/// `expected`/`replacement` borrow directly from `data`, so their
+/// lengths are whatever slicing at these derived offsets/lengths
+/// happens to yield — including a length mismatch between the two,
+/// which is deliberately exercised rather than avoided.
+fn patches_from_input(data: &[u8]) -> [PatchOp<'_>; 4] {
+    let len_a = usize_at(data, 40).min(data.len().saturating_sub(usize_at(data, 0).min(data.len())));
+    let off_a = usize_at(data, 0).min(data.len());
+    let expected_a = data.get(off_a..off_a + len_a).unwrap_or(&[]);
+
+    [
+        // Likely in-bounds for small inputs, likely out-of-bounds for
+        // larger/adversarial ones; expected/replacement same length.
+        PatchOp {
+            offset: usize_at(data, 0),
+            expected: expected_a,
+            replacement: expected_a,
+        },
+        // Zero-length is always in-bounds (a no-op write), whatever the
+        // offset.
+        PatchOp {
+            offset: usize_at(data, 16),
+            expected: &[],
+            replacement: &[],
+        },
+        // Deliberately pushed toward usize::MAX so offset+expected.len()
+        // has a real chance of overflowing in the checked-add path.
+        PatchOp {
+            offset: usize::MAX - usize_at(data, 24).min(4),
+            expected: data.get(..1).unwrap_or(&[]),
+            replacement: data.get(..1).unwrap_or(&[]),
+        },
+        // Mismatched expected/replacement lengths (unless data is too
+        // short to slice both differently), exercising LengthMismatch.
+        PatchOp {
+            offset: 0,
+            expected: data.get(..data.len().min(2)).unwrap_or(&[]),
+            replacement: data.get(..data.len().min(3)).unwrap_or(&[]),
+        },
+    ]
+}
+
 fuzz_target!(|data: &[u8]| {
     // --- Loader::detect ------------------------------------------------
     let _ = Loader::detect(data);
@@ -141,4 +199,14 @@ fuzz_target!(|data: &[u8]| {
     // --- split: bounds-check derived-from-input module ranges ----------
     let specs = module_specs_from_input(data);
     let _ = split(data, &specs);
+
+    // --- combine: split input in half as the two candidate images ------
+    let mid = data.len() / 2;
+    let (a, b) = data.split_at(mid);
+    let _ = combine(a, b);
+
+    // --- apply_patches: derived-from-input patches on a mutable copy ---
+    let mut patch_target = data.to_vec();
+    let patches = patches_from_input(data);
+    let _ = apply_patches(&mut patch_target, &patches);
 });

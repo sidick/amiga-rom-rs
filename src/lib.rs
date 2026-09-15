@@ -47,7 +47,12 @@
 //! scoped down to just [`split`]: bounds-checked, borrowed-output
 //! extraction of caller-supplied [`ModuleSpec`] ranges, with no
 //! `ModuleCatalog` trait, no overlap detection, and no catalog-identity
-//! matching — see that function's doc comment.
+//! matching — see that function's doc comment. Milestone 5 adds
+//! [`combine`] (concatenating two validated 512 KiB Kickstart/Ext ROM
+//! images) and the patch mechanism ([`apply_patches`]/[`PatchOp`]):
+//! generic find/verify/replace over a ROM buffer, with no actual patch
+//! data (e.g. `1mb_rom`) shipped — see those items' doc comments and
+//! `PLAN.md`'s "Milestone 5" section.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -1068,6 +1073,305 @@ pub fn split<'a>(rom: &'a [u8], modules: &[ModuleSpec<'a>]) -> Result<Vec<Module
         });
     }
     Ok(out)
+}
+
+/// Identifies which of [`combine`]'s two input slices an error refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSide {
+    /// `combine`'s first parameter (contributes the *first* half of the
+    /// output).
+    First,
+    /// `combine`'s second parameter (contributes the *second* half of
+    /// the output).
+    Second,
+}
+
+/// Errors from [`combine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombineError {
+    /// The named input is not exactly [`ROM_SIZE_512K`] bytes, or does
+    /// not pass [`KickRom::is_kick_rom`] at that size — matching
+    /// `romtool`'s own "Not a Kick ROM image!" rejection, which does not
+    /// distinguish a size problem from a validity problem either.
+    /// `size` is the input's actual length, for a caller that wants to
+    /// report *something* more specific than "invalid".
+    InvalidInput {
+        /// Which of `combine`'s two parameters was invalid.
+        which: InputSide,
+        /// The input's actual length in bytes.
+        size: usize,
+    },
+}
+
+impl fmt::Display for CombineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CombineError::InvalidInput { which, size } => {
+                let side = match which {
+                    InputSide::First => "first",
+                    InputSide::Second => "second",
+                };
+                write!(
+                    f,
+                    "{} input ({} bytes) is not a valid {}-byte Kickstart ROM image",
+                    side, size, ROM_SIZE_512K
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CombineError {}
+
+/// Concatenates two validated 512 KiB Kickstart ROM images into one
+/// 1 MiB blob, matching `romtool combine`'s documented purpose:
+/// "Concatenate a 512 KiB Kickstart and a 512 KiB Ext ROM image to
+/// create a 1 MiB ROM suitable for soft kickers or maprom tools." See
+/// `PLAN.md`'s "Milestone 5" section for the full empirical write-up
+/// this implements.
+///
+/// # Byte order — read this before calling
+///
+/// **`combine(first, second)` returns `first`'s bytes followed by
+/// `second`'s bytes, literally `[first, second].concat()`.** Nothing
+/// else: no reseal, no header/footer touch of either half or of the
+/// result.
+///
+/// This crate's parameters are named by their **position in the
+/// output**, deliberately avoiding "kick"/"ext" labels — because
+/// `romtool`'s own CLI argument order is a proven footgun. `PLAN.md`
+/// records this exact empirical fact: **`romtool combine kick.rom
+/// ext.rom -o out.rom` writes `ext.rom`'s bytes first, `kick.rom`'s
+/// bytes second — the *second* positional argument comes first in the
+/// output, reversed from what the argument names suggest.** This was
+/// confirmed by swapping the call and observing `combine(ext, kick)`
+/// (in romtool's argument order) produce `kick_bytes ++ ext_bytes` byte
+/// for byte.
+///
+/// **A caller wanting to replicate `romtool combine kick.rom
+/// ext.rom`'s CLI behavior must call this crate's
+/// `combine(ext_bytes, kick_bytes)` — with the arguments swapped
+/// relative to romtool's own — because that's what romtool's CLI
+/// actually produces despite its argument names.** Do not "fix" this by
+/// passing `(kick_bytes, ext_bytes)` in the naive order; that reproduces
+/// what romtool's names suggest, not what romtool's CLI does.
+///
+/// # Validation
+///
+/// Each of `first`/`second` must independently be exactly
+/// [`ROM_SIZE_512K`] bytes *and* pass [`KickRom::is_kick_rom`] —
+/// oracle-confirmed: romtool rejects an invalid or wrong-size input
+/// with "Not a Kick ROM image!". Neither the two halves nor the
+/// combined 1 MiB result are transformed or resealed; the combined
+/// result is **not** expected to itself pass `KickRom::is_kick_rom` as
+/// one coherent image (`check_size` alone already rejects a 1 MiB
+/// buffer) — it's a raw two-bank blob for hardware tools, not a
+/// validated single ROM.
+///
+/// # Errors
+///
+/// [`CombineError::InvalidInput`] naming whichever of `first`/`second`
+/// fails the 512 KiB size or `is_kick_rom` check first (`first` is
+/// checked before `second`).
+pub fn combine(first: &[u8], second: &[u8]) -> Result<Vec<u8>, CombineError> {
+    if first.len() != ROM_SIZE_512K || !KickRom::new(first).is_kick_rom() {
+        return Err(CombineError::InvalidInput {
+            which: InputSide::First,
+            size: first.len(),
+        });
+    }
+    if second.len() != ROM_SIZE_512K || !KickRom::new(second).is_kick_rom() {
+        return Err(CombineError::InvalidInput {
+            which: InputSide::Second,
+            size: second.len(),
+        });
+    }
+    Ok([first, second].concat())
+}
+
+/// One caller-supplied byte-for-byte edit for [`apply_patches`]: replace
+/// `expected` with `replacement` at `offset`, but only after confirming
+/// `expected` matches the buffer's *current* contents there.
+///
+/// `expected.len()` must equal `replacement.len()` — a patch that
+/// changes length isn't a byte-for-byte replace, and `rom` is a
+/// fixed-size `&mut [u8]` that can't be resized in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchOp<'a> {
+    /// Byte offset within the ROM where this patch applies.
+    pub offset: usize,
+    /// The bytes `rom[offset..offset + expected.len()]` must currently
+    /// hold for this patch to be considered safe to apply.
+    pub expected: &'a [u8],
+    /// The bytes to write in place of `expected`.
+    pub replacement: &'a [u8],
+}
+
+/// Errors from [`apply_patches`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchError {
+    /// A [`PatchOp`]'s `offset..offset+expected.len()` range does not
+    /// fit within the ROM: either the addition overflows `usize` (a
+    /// hostile offset/length pair), or the resulting end exceeds
+    /// `rom.len()`. `index` is this patch's position in the `patches`
+    /// slice passed to [`apply_patches`].
+    OffsetOutOfBounds {
+        /// Index of the offending [`PatchOp`] within the `patches`
+        /// slice.
+        index: usize,
+        /// The requested offset.
+        offset: usize,
+        /// The `expected`/`replacement` length.
+        len: usize,
+        /// The ROM's actual length.
+        rom_len: usize,
+    },
+    /// A [`PatchOp`]'s `expected` bytes did not match the ROM's current
+    /// contents at `offset`. `index` is this patch's position in the
+    /// `patches` slice — the mismatched bytes themselves are
+    /// deliberately not included here (kept cheap and alloc-free); a
+    /// caller can look up `patches[index]` itself for detail.
+    ExpectedMismatch {
+        /// Index of the offending [`PatchOp`] within the `patches`
+        /// slice.
+        index: usize,
+    },
+    /// A [`PatchOp`]'s `expected` and `replacement` slices have
+    /// different lengths, which is not a byte-for-byte replace and
+    /// can't be applied to a fixed-size buffer in place.
+    LengthMismatch {
+        /// Index of the offending [`PatchOp`] within the `patches`
+        /// slice.
+        index: usize,
+        /// `expected.len()`.
+        expected_len: usize,
+        /// `replacement.len()`.
+        replacement_len: usize,
+    },
+}
+
+impl fmt::Display for PatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PatchError::OffsetOutOfBounds {
+                index,
+                offset,
+                len,
+                rom_len,
+            } => {
+                write!(
+                    f,
+                    "patch {} at offset {} length {} does not fit within a {}-byte ROM",
+                    index, offset, len, rom_len
+                )
+            }
+            PatchError::ExpectedMismatch { index } => {
+                write!(
+                    f,
+                    "patch {} expected bytes do not match the ROM's current contents",
+                    index
+                )
+            }
+            PatchError::LengthMismatch {
+                index,
+                expected_len,
+                replacement_len,
+            } => {
+                write!(
+                    f,
+                    "patch {} expected.len() ({}) does not equal replacement.len() ({})",
+                    index, expected_len, replacement_len
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PatchError {}
+
+/// Applies a list of byte-for-byte edits to `rom`, per `PLAN.md`'s
+/// "Milestone 5" patch-framework decision: this crate ships only the
+/// *mechanism* (find/verify/replace with expected-bytes safety), not
+/// any actual patch data such as `1mb_rom` — deriving that patch's real
+/// bytes/offsets is separate, later work.
+///
+/// # Two-pass safety discipline
+///
+/// All `patches` are verified against `rom`'s *current* contents before
+/// any byte is written — a two-pass verify-then-apply, mirroring
+/// `RdbBuilder`'s "compute the whole layout before writing a single
+/// block" discipline in the sibling crate. If any patch fails
+/// verification, `rom` is returned completely untouched: there is no
+/// partially-patched outcome, ever. Only after every patch passes
+/// verification does the second pass write the replacements.
+///
+/// Each patch's `offset..offset+expected.len()` range is bounds-checked
+/// with [`usize::checked_add`] before any comparison, so a hostile or
+/// absurd offset (e.g. `offset: usize::MAX`) reports
+/// [`PatchError::OffsetOutOfBounds`] rather than panicking on overflow
+/// or indexing out of bounds.
+///
+/// This does **not** reseal the ROM's checksum — that's a separate,
+/// already-existing step ([`seal_checksum`]) a caller composes
+/// afterward if it wants a checksum-valid result.
+///
+/// # Overlapping patches
+///
+/// No overlap detection: same "not this crate's job" reasoning as
+/// [`split`]. Because verification checks every patch's `expected`
+/// against the *original* `rom` contents (before any patch in this call
+/// has written anything), two patches whose ranges overlap are both
+/// verified against the same original bytes — this is well-defined,
+/// documented behavior, not a corner case to reject. Patches are then
+/// applied in list order, so for genuinely overlapping ranges the later
+/// patch's write wins for the overlapping bytes.
+///
+/// # Errors
+///
+/// The first (by index) failing patch determines the error:
+/// [`PatchError::LengthMismatch`] if `expected.len() != replacement.len()`;
+/// [`PatchError::OffsetOutOfBounds`] if the range doesn't fit in `rom`;
+/// [`PatchError::ExpectedMismatch`] if the range fits but `rom`'s
+/// current bytes there don't equal `expected`. These are all checked in
+/// this order, per patch, during the verification pass — so a patch
+/// index reported for `LengthMismatch`/`OffsetOutOfBounds` may leave a
+/// later patch's own mismatch unreported (verification also fails fast,
+/// same as [`split`]).
+pub fn apply_patches(rom: &mut [u8], patches: &[PatchOp]) -> Result<(), PatchError> {
+    // --- Pass 1: verify every patch against the ROM's current, ---------
+    // --- unmodified contents. No writes happen in this pass. -----------
+    for (index, patch) in patches.iter().enumerate() {
+        if patch.expected.len() != patch.replacement.len() {
+            return Err(PatchError::LengthMismatch {
+                index,
+                expected_len: patch.expected.len(),
+                replacement_len: patch.replacement.len(),
+            });
+        }
+        let end = match patch.offset.checked_add(patch.expected.len()) {
+            Some(end) if end <= rom.len() => end,
+            _ => {
+                return Err(PatchError::OffsetOutOfBounds {
+                    index,
+                    offset: patch.offset,
+                    len: patch.expected.len(),
+                    rom_len: rom.len(),
+                })
+            }
+        };
+        if &rom[patch.offset..end] != patch.expected {
+            return Err(PatchError::ExpectedMismatch { index });
+        }
+    }
+
+    // --- Pass 2: every patch verified — now actually write them. -------
+    for patch in patches.iter() {
+        let end = patch.offset + patch.expected.len();
+        rom[patch.offset..end].copy_from_slice(patch.replacement);
+    }
+    Ok(())
 }
 
 /// Test-only synthetic Kickstart image fixtures — never ships real ROM
@@ -2206,5 +2510,295 @@ mod split_tests {
         assert_eq!(modules.len(), 2);
         assert_eq!(modules[0].data, &[] as &[u8]);
         assert_eq!(modules[1].data, &[] as &[u8]);
+    }
+}
+
+#[cfg(test)]
+mod combine_tests {
+    use super::fixtures::{synthetic_rom, RomFixtureParams};
+    use super::*;
+    use alloc::vec;
+
+    /// Two distinct-content valid 512 KiB fixtures, made distinguishable
+    /// by their `rom_rev`/`exec_rev` (which land at different header
+    /// bytes) so `first != second` and combine's output halves are
+    /// unambiguous.
+    fn two_distinct_fixtures() -> (Vec<u8>, Vec<u8>) {
+        let mut a_params = RomFixtureParams::new_512k();
+        a_params.rom_rev = (1, 0);
+        let mut b_params = RomFixtureParams::new_512k();
+        b_params.rom_rev = (2, 0);
+        let a = synthetic_rom(a_params);
+        let b = synthetic_rom(b_params);
+        assert_ne!(
+            a, b,
+            "fixtures must actually differ for these tests to mean anything"
+        );
+        (a, b)
+    }
+
+    #[test]
+    fn combines_two_valid_fixtures_byte_for_byte() {
+        let (a, b) = two_distinct_fixtures();
+        let combined = combine(&a, &b).unwrap();
+        assert_eq!(combined.len(), ROM_SIZE_512K * 2);
+        assert_eq!(&combined[..ROM_SIZE_512K], &a[..]);
+        assert_eq!(&combined[ROM_SIZE_512K..], &b[..]);
+    }
+
+    #[test]
+    fn wrong_size_first_is_rejected_identifying_first() {
+        let (_, b) = two_distinct_fixtures();
+        let too_small = vec![0u8; ROM_SIZE_512K - 1];
+        assert_eq!(
+            combine(&too_small, &b),
+            Err(CombineError::InvalidInput {
+                which: InputSide::First,
+                size: ROM_SIZE_512K - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_size_second_is_rejected_identifying_second() {
+        let (a, _) = two_distinct_fixtures();
+        let too_big = vec![0u8; ROM_SIZE_512K + 1];
+        assert_eq!(
+            combine(&a, &too_big),
+            Err(CombineError::InvalidInput {
+                which: InputSide::Second,
+                size: ROM_SIZE_512K + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn same_size_but_invalid_first_is_rejected() {
+        let (a, b) = two_distinct_fixtures();
+        let mut corrupt = a.clone();
+        // Corrupt a content byte without re-sealing: right size, fails
+        // is_kick_rom (checksum no longer verifies).
+        corrupt[0x200] ^= 0xFF;
+        assert_eq!(corrupt.len(), ROM_SIZE_512K);
+        assert!(!KickRom::new(&corrupt).is_kick_rom());
+        assert_eq!(
+            combine(&corrupt, &b),
+            Err(CombineError::InvalidInput {
+                which: InputSide::First,
+                size: ROM_SIZE_512K,
+            })
+        );
+    }
+
+    #[test]
+    fn same_size_but_invalid_second_is_rejected() {
+        let (a, b) = two_distinct_fixtures();
+        let mut corrupt = b.clone();
+        corrupt[0x200] ^= 0xFF;
+        assert_eq!(corrupt.len(), ROM_SIZE_512K);
+        assert!(!KickRom::new(&corrupt).is_kick_rom());
+        assert_eq!(
+            combine(&a, &corrupt),
+            Err(CombineError::InvalidInput {
+                which: InputSide::Second,
+                size: ROM_SIZE_512K,
+            })
+        );
+    }
+
+    /// The swapped-order fact itself: `combine(a, b) != combine(b, a)`
+    /// for two fixtures with different content, and each direction
+    /// equals the expected concatenation in its own order. This is the
+    /// single most important behavior in this module — see `combine`'s
+    /// doc comment for why.
+    #[test]
+    fn combine_is_not_commutative() {
+        let (a, b) = two_distinct_fixtures();
+        let ab = combine(&a, &b).unwrap();
+        let ba = combine(&b, &a).unwrap();
+        assert_ne!(ab, ba);
+
+        let mut expected_ab = a.clone();
+        expected_ab.extend_from_slice(&b);
+        assert_eq!(ab, expected_ab);
+
+        let mut expected_ba = b.clone();
+        expected_ba.extend_from_slice(&a);
+        assert_eq!(ba, expected_ba);
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn empty_patch_list_is_a_no_op_success() {
+        let mut rom = vec![1u8, 2, 3, 4];
+        let original = rom.clone();
+        assert_eq!(apply_patches(&mut rom, &[]), Ok(()));
+        assert_eq!(rom, original);
+    }
+
+    #[test]
+    fn one_in_bounds_patch_changes_exactly_those_bytes() {
+        let mut rom = vec![0xAAu8; 16];
+        let patch = PatchOp {
+            offset: 4,
+            expected: &[0xAA, 0xAA],
+            replacement: &[0x11, 0x22],
+        };
+        assert_eq!(apply_patches(&mut rom, &[patch]), Ok(()));
+        let mut expected = vec![0xAAu8; 16];
+        expected[4] = 0x11;
+        expected[5] = 0x22;
+        assert_eq!(rom, expected);
+    }
+
+    #[test]
+    fn expected_mismatch_fails_and_leaves_rom_untouched() {
+        let mut rom = vec![0xAAu8; 16];
+        let original = rom.clone();
+        let patch = PatchOp {
+            offset: 4,
+            expected: &[0xBB, 0xBB], // does not match current contents
+            replacement: &[0x11, 0x22],
+        };
+        assert_eq!(
+            apply_patches(&mut rom, &[patch]),
+            Err(PatchError::ExpectedMismatch { index: 0 })
+        );
+        assert_eq!(rom, original, "rom must be byte-for-byte unchanged");
+    }
+
+    #[test]
+    fn offset_out_of_bounds_fails_without_panicking() {
+        let mut rom = vec![0xAAu8; 16];
+        let original = rom.clone();
+        let patch = PatchOp {
+            offset: 15,
+            expected: &[0xAA, 0xAA], // would need bytes 15..17, out of bounds
+            replacement: &[0x11, 0x22],
+        };
+        assert_eq!(
+            apply_patches(&mut rom, &[patch]),
+            Err(PatchError::OffsetOutOfBounds {
+                index: 0,
+                offset: 15,
+                len: 2,
+                rom_len: 16,
+            })
+        );
+        assert_eq!(rom, original);
+    }
+
+    #[test]
+    fn usize_overflowing_offset_fails_without_panicking() {
+        let mut rom = vec![0xAAu8; 16];
+        let original = rom.clone();
+        let patch = PatchOp {
+            offset: usize::MAX,
+            expected: &[0xAA],
+            replacement: &[0x11],
+        };
+        assert_eq!(
+            apply_patches(&mut rom, &[patch]),
+            Err(PatchError::OffsetOutOfBounds {
+                index: 0,
+                offset: usize::MAX,
+                len: 1,
+                rom_len: 16,
+            })
+        );
+        assert_eq!(rom, original);
+    }
+
+    #[test]
+    fn expected_replacement_length_mismatch_fails_with_its_own_variant() {
+        let mut rom = vec![0xAAu8; 16];
+        let original = rom.clone();
+        let patch = PatchOp {
+            offset: 0,
+            expected: &[0xAA, 0xAA],
+            replacement: &[0x11, 0x22, 0x33],
+        };
+        assert_eq!(
+            apply_patches(&mut rom, &[patch]),
+            Err(PatchError::LengthMismatch {
+                index: 0,
+                expected_len: 2,
+                replacement_len: 3,
+            })
+        );
+        assert_eq!(rom, original);
+    }
+
+    #[test]
+    fn multiple_valid_nonoverlapping_patches_all_apply() {
+        let mut rom = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
+        let patches = [
+            PatchOp {
+                offset: 0,
+                expected: &[0, 1],
+                replacement: &[0xAA, 0xBB],
+            },
+            PatchOp {
+                offset: 4,
+                expected: &[4, 5],
+                replacement: &[0xCC, 0xDD],
+            },
+            PatchOp {
+                offset: 6,
+                expected: &[6, 7],
+                replacement: &[0xEE, 0xFF],
+            },
+        ];
+        assert_eq!(apply_patches(&mut rom, &patches), Ok(()));
+        assert_eq!(rom, vec![0xAA, 0xBB, 2, 3, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    /// The central proof of the two-pass discipline: patch 3 of 5 fails
+    /// verification, so *none* of the five apply — not "patches 1-2
+    /// applied, 3-5 not".
+    #[test]
+    fn one_failing_patch_among_five_leaves_rom_completely_unpatched() {
+        let mut rom = vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let original = rom.clone();
+        let patches = [
+            PatchOp {
+                offset: 0,
+                expected: &[0],
+                replacement: &[0xA0],
+            },
+            PatchOp {
+                offset: 1,
+                expected: &[1],
+                replacement: &[0xA1],
+            },
+            PatchOp {
+                offset: 2,
+                expected: &[0xFF], // wrong: rom[2] is actually 2
+                replacement: &[0xA2],
+            },
+            PatchOp {
+                offset: 3,
+                expected: &[3],
+                replacement: &[0xA3],
+            },
+            PatchOp {
+                offset: 4,
+                expected: &[4],
+                replacement: &[0xA4],
+            },
+        ];
+        assert_eq!(
+            apply_patches(&mut rom, &patches),
+            Err(PatchError::ExpectedMismatch { index: 2 })
+        );
+        assert_eq!(
+            rom, original,
+            "no patch may apply when any patch in the list fails verification"
+        );
     }
 }

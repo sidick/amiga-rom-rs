@@ -531,7 +531,7 @@ this crate's own `seal_checksum`, never real ROM bytes) — the original
 draft of this section had two facts wrong, caught before they reached
 an implementation brief; see the corrections below.
 
-- [ ] **`copy --fix-checksum`** — **needs zero new library code.**
+- [x] **`copy --fix-checksum`** — **needs zero new library code.**
       Docs: "Copy a rom to a new file... `-c`/`--fix-checksum` after
       the copy fix the checksum of the written image." That's exactly
       `Loader::normalize` (if the input isn't already canonical) +
@@ -541,7 +541,15 @@ an implementation brief; see the corrections below.
       anything `romtool copy` actually does — dropped. Nothing to
       implement here; `copy` is purely the CLI crate wiring two
       existing primitives together.
-- [ ] **`combine`** — docs: "Concatenate a 512 KiB Kickstart and a
+- [x] **`combine`** — implemented exactly per the design below:
+      `combine(first: &[u8], second: &[u8]) -> Result<Vec<u8>,
+      CombineError>`, `CombineError::InvalidInput { which: InputSide,
+      size }`. The doc comment states the swap fact prominently (front
+      and center, with an explicit "don't do the naive fix" warning) —
+      reviewed line-by-line by the parent session specifically for
+      this, since getting it backwards would be the worst possible bug
+      here. `combine_is_not_commutative` test proves it. — docs:
+      "Concatenate a 512 KiB Kickstart and a
       512 KiB Ext ROM image to create a 1 MiB ROM suitable for soft
       kickers or maprom tools." **Corrects the original draft**, which
       wrongly assumed this was the milestone-1 kickety-split concept
@@ -578,7 +586,14 @@ an implementation brief; see the corrections below.
       loud comment there explaining why — the confusion stays
       contained to one documented call site instead of leaking into
       this crate's naming.
-- [ ] **Patch framework** — docs confirm only **one** named built-in
+- [x] **Patch framework** — implemented: `PatchOp<'a>{offset, expected,
+      replacement}`, `apply_patches(rom: &mut [u8], patches: &[PatchOp])
+      -> Result<(), PatchError>` (`OffsetOutOfBounds`/
+      `ExpectedMismatch`/`LengthMismatch`, each identifying the failing
+      patch's index). Two-pass verify-then-apply, proven by a dedicated
+      test (patch 3 of 5 failing leaves `rom` byte-for-byte untouched,
+      not partially patched). No `1mb_rom` data shipped, per the
+      decision below. — docs confirm only **one** named built-in
       patch exists: `1mb_rom`, "Patch Kickstart to support ext ROM
       with 512 KiB" (pairs with `combine` above — it's what makes a
       Kickstart recognize the resulting 1 MiB layout). **Corrects the
