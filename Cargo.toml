@@ -1,0 +1,31 @@
+[package]
+name = "amiga-rom"
+version = "0.1.0"
+edition = "2021"
+# Conservative floor, matching amiga-ffs/amiga-rdb: nothing here needs
+# anything newer, and old toolchains are common in retrocomputing/distro
+# packaging. Raising it is a semver-visible decision, not an accident.
+rust-version = "1.63"
+license = "MIT OR Apache-2.0"
+description = "Amiga Kickstart ROM images: inspect, normalize (byte-order, Cloanto-encoded, hi/lo EPROM split), validate"
+repository = "https://github.com/sidick/amiga-rom-rs"
+keywords = ["amiga", "kickstart", "rom", "retrocomputing"]
+categories = ["no-std", "parser-implementations", "emulators"]
+
+[package.metadata.docs.rs]
+# Build docs with every feature on, so the std-only items
+# (std::error::Error impls) are documented too.
+all-features = true
+
+[dependencies]
+# Deliberately none. This crate is pure format logic over `&[u8]`/
+# `&mut [u8]`; consumers bring their own file I/O.
+
+[features]
+default = ["std"]
+# `std` only adds a convenience: std::error::Error impls on this crate's
+# error types. The core crate is no_std + alloc throughout — `alloc` is
+# needed only by the normalize/merge/split functions that own an output
+# buffer; `KickRom` itself is allocation-free, operating on a borrowed
+# `&[u8]`.
+std = []
