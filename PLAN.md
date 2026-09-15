@@ -455,32 +455,57 @@ milestone 2.)
       CLI proves something missing (in which case it gets added here
       first).
 
-## Milestone 4 — split / build (modules)
+## Milestone 4 — split (modules), scoped down
 
 The catalog-dependent half of `romtool`, gated on the licensing
-reality up top: the crate defines the *interfaces*, users supply the
-*data*.
+reality up top: the crate defines a minimal *interface*, users supply
+the *data*. **Scoped to `split` only** for this pass (grilled
+2026-09-15) — `build` needs hunk parsing/writing and relocation
+application, which is real, separable work; doing `split` alone first
+proves the module-data shape against something real before that
+complexity is taken on.
 
-- [ ] **Pluggable catalog trait**: `ModuleCatalog` — given a ROM's
-      identity (KickSum + size + revision is the working key; Remus
-      and SKick both key on KickSum, which this crate computes for
-      free), yield module boundaries/names/relocation info. The
-      crate ships the trait and a documented, versioned *file format*
-      for the data (so independent catalog-building efforts have a
-      target), but no data.
-- [ ] **`split`**: with a catalog, cut a ROM into per-module binaries
-      with relocation tables — output format decided with the
-      catalog trait (needs to be LoadSeg()able hunks to be useful,
-      which means hunk *writing*).
-- [ ] **`build`**: inverse — lay out LoadSeg()able modules into a ROM
-      image, applying hunk relocations to the ROM's base address,
-      emitting header/footer/checksum via the milestone-2 sealer.
-      Hunk parsing/relocation scope decision needed here: implement
-      the minimal hunk subset in this crate vs depend on a future
-      `amiga-hunk` crate — **decide when reached**, leaning to a
-      separate crate since `amiga-ffs`' LoadSeg consumers want it
-      too.
-- [ ] **`list`/`query` stay CLI-side** over the catalog trait.
+Design decisions from that session, each with its reasoning:
+
+- **No `ModuleCatalog` trait.** A trait implies polymorphism, and
+  nothing today needs it: this crate does zero file I/O (established
+  since milestone 1), so a catalog *file format* is the CLI crate's
+  concern, not this one's — the "crate ships a documented file
+  format" idea from the original draft is dropped. `split` just takes
+  plain data: `split(rom: &[u8], modules: &[ModuleSpec]) ->
+  Result<Vec<Module>, SplitError>`, where `ModuleSpec` is `{name,
+  offset, length}` and nothing else (no relocation data, no "kind"
+  tag, no cross-reference to milestone 3's `ResidentScan` — scanning
+  and catalog-driven splitting stay unrelated concepts). Introduce a
+  trait later only if a second real shape of catalog data shows up to
+  abstract over.
+- **No catalog-identity matching in this crate.** `split` bounds-checks
+  each module range against the ROM it's actually given (a hard
+  safety property, matching every other check in this crate), but has
+  no opinion on whether the `ModuleSpec` list "belongs" to that ROM —
+  matching a catalog to a ROM by KickSum is a lookup step that happens
+  entirely outside this crate, before `split` is ever called.
+- **No overlap detection between module ranges.** Two `ModuleSpec`
+  entries claiming the same bytes is a semantic complaint about the
+  catalog's own consistency, not a memory-safety concern (`&rom[a..b]`
+  and `&rom[c..d]` overlapping is safe to construct) — out of scope
+  here, matching the "no premature abstraction" convention.
+- **Output is borrowed, not owned.** `split` never transforms bytes,
+  only cuts them, so it returns slices into the input ROM
+  (`&'a [u8]` per module), consistent with `KickRom`'s and
+  `ResidentScan`'s existing allocation-free convention. A caller
+  wanting an owned `Vec<u8>` per module calls `.to_vec()` themselves.
+- [ ] **Implement per the above** once picked back up.
+- [ ] **`list`/`query`/`build` deferred** — not part of this milestone;
+      revisit once `split` is proven and the hunk-parsing/relocation
+      scope decision (implement inline vs depend on a crate) is
+      reached. `hunkfile` (crates.io, 0BSD) was surveyed
+      2026-09-15 and found **not viable as a dependency**: std-only
+      (no no_std path), and it only exposes raw relocation *records*
+      — not application logic — so the actual value this crate would
+      need isn't there anyway. No other Amiga hunk-format crate exists
+      on crates.io. Leaning toward a minimal inline implementation
+      when `build` is reached, not a dependency.
 
 ## Milestone 5 — patch / combine / copy
 
@@ -500,6 +525,65 @@ reality up top: the crate defines the *interfaces*, users supply the
       question deferred to when reached — amitools' one built-in
       (1.x scsi.device disable) may be small enough to re-derive
       independently.
+
+## Milestone 6 — independent module-boundary detection (last, deliberately)
+
+**Decided 2026-09-15: pursue this, but after everything else** — it's
+a real research problem, not an implementation task, and shouldn't
+block anything simpler. The goal: derive Remus/Romsplit-equivalent
+module boundary data (and, later, relocation info) *without* Doobrey's
+or Troller's restricted files as an input — an independent replacement
+for the milestone-4 catalog data, built the same way this whole crate
+has been: facts confirmed from primary sources, GPL/restricted tools
+used only as black-box behavioral oracles, never read or copied from.
+
+**Why this is hard, confirmed from amitools' own documentation, not
+assumed:** `romtool`'s docs state outright — "splitting a ROM is a
+difficult process as the borders of the modules are not clearly
+marked in the ROM and furthermore the code positions that require
+relocation are not marked at all... splitting is done with the help
+of a split data catalog." This is a different class of problem than
+milestones 1–3, which all worked because the format announces itself
+somewhere (fixed header offsets; a matchword the CPU traps on if
+executed). A production-linked Kickstart ROM strips exactly the
+information — hunk separators, symbol boundaries — that would make a
+module's start/end self-evident. This is closer to "decompile which
+bytes came from which source file": likely fuzzy heuristics (code
+fingerprinting, cross-referencing published SDK object files, entropy
+analysis), not a deterministic decoder, and there's no guarantee it's
+fully solvable without debug info that was never shipped.
+
+**What's already available for free, no restricted data needed:**
+milestone 3's `ResidentScan` already yields genuine module *start*
+offsets — every `Resident` hit's own offset is a real boundary, since
+the matchword self-announces. That only covers library/device/resource
+init points (not arbitrary internal modules) and gives no *end*
+boundary (`rt_EndSkip` is deliberately never trusted, per milestone 3).
+Whatever this milestone builds should start from that free structural
+anchor before reaching for heuristics.
+
+**The legal discipline, non-negotiable if this is attempted:**
+- Design and implement using only the ROM bytes and publicly
+  documented Amiga linking/compilation conventions. **Never open
+  Doobrey's or Troller's files while designing or writing this code**
+  — no "read their format to learn the trick," no consulting their
+  data mid-implementation. That crosses from independent derivation
+  into the access-plus-reproduce pattern PLAN.md's licensing section
+  already flagged as risky (their EULA is "no redistribution... no
+  license grant," not GPL — there's no broad use-and-study right to
+  lean on the way there is with amitools).
+- If their published data is used *afterward* purely as a correctness
+  check, treat it exactly like the `AMIGA_ROM_DIR` real-ROM harness:
+  **private and local-only, never committed to the repo, never
+  published as a diff or comparison report, and never allowed to
+  "correct" the independent algorithm** — a mismatch is a bug to debug
+  against the ROM itself, not license to copy their answer. This
+  mirrors the amitools-as-oracle discipline already proven throughout
+  this project, tightened because the license terms here are stricter.
+- Get real legal advice before publishing anything derived this way —
+  this crate's own research has consistently erred toward caution on
+  Doobrey/Troller material (see the licensing section up top), and
+  that caution should carry through here.
 
 ## Cross-cutting
 
