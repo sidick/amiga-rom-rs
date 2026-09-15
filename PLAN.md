@@ -523,22 +523,75 @@ Design decisions from that session, each with its reasoning:
 
 ## Milestone 5 — patch / combine / copy
 
-- [ ] **`copy --fix-checksum`** needs only milestone 2's
-      `seal_checksum` — expose the ergonomic "fix this image in
-      place" wrapper and the byte-order/Cloanto/hi-lo *encode*
-      directions (`Loader`'s inverse: canonical → burner-ready), per
-      the milestone-1 conventions item.
-- [ ] **`combine`**: join a 256 KiB kick + 256 KiB ext ROM into
-      512 KiB (the kickety-split layout from milestone 1, now
-      written rather than just detected), re-sealed.
-- [ ] **Patch framework**: named patches applied to known ROMs
-      (`romtool patch`'s model: identify ROM by checksum, apply
-      byte-level edits, re-seal). The crate ships the *mechanism*
-      (find/verify/replace with expected-bytes safety, like a binary
-      patch format); which patches ship as data is a licensing
-      question deferred to when reached — amitools' one built-in
-      (1.x scsi.device disable) may be small enough to re-derive
-      independently.
+Facts below confirmed 2026-09-15 against amitools' docs
+(https://amitools.readthedocs.io/en/latest/tools/romtool.html, quoted
+directly) and, where the docs were silent, empirically against
+`romtool` as a black-box oracle (synthetic 512 KiB fixtures built with
+this crate's own `seal_checksum`, never real ROM bytes) — the original
+draft of this section had two facts wrong, caught before they reached
+an implementation brief; see the corrections below.
+
+- [ ] **`copy --fix-checksum`** — **needs zero new library code.**
+      Docs: "Copy a rom to a new file... `-c`/`--fix-checksum` after
+      the copy fix the checksum of the written image." That's exactly
+      `Loader::normalize` (if the input isn't already canonical) +
+      `seal_checksum`, both already shipped since milestone 2. The
+      *byte-order/Cloanto/hi-lo encode-direction* idea in this item's
+      original draft was this plan's own scope inflation, not
+      anything `romtool copy` actually does — dropped. Nothing to
+      implement here; `copy` is purely the CLI crate wiring two
+      existing primitives together.
+- [ ] **`combine`** — docs: "Concatenate a 512 KiB Kickstart and a
+      512 KiB Ext ROM image to create a 1 MiB ROM suitable for soft
+      kickers or maprom tools." **Corrects the original draft**, which
+      wrongly assumed this was the milestone-1 kickety-split concept
+      (256 KiB halves, self-referential midpoint header) — unrelated;
+      `combine` is a completely different, larger-scale operation with
+      no connection to kickety-split.
+
+      **Confirmed empirically, and genuinely surprising — verify
+      against this before implementing, don't assume CLI arg order
+      matches output order:** `romtool combine kick.rom ext.rom -o
+      out.rom` writes **`ext.rom`'s bytes first, `kick.rom`'s bytes
+      second** — the *second* positional argument comes first in the
+      output, reversed from what the argument names suggest. Proven
+      by swapping the call (`combine(ext, kick)` byte-for-byte equals
+      `kick_bytes ++ ext_bytes`, the "naively expected" order) — not a
+      one-off fluke. Also confirmed: both inputs must independently
+      pass full `is_kick` validity (an invalid/all-zero 512 KiB buffer
+      is rejected, "Not a Kick ROM image!"); the two halves' bytes are
+      **not otherwise transformed** (no reseal, no header/footer
+      touch); the combined 1 MiB output is **not** itself resealed or
+      expected to pass `KickRom`'s own checks as one coherent image
+      (`check_size` correctly rejects it — it's a raw two-bank blob
+      for hardware tools, not a validated single ROM).
+
+      **API decision so this crate doesn't propagate romtool's
+      confusing argument-order footgun**: name the library function's
+      parameters by *position in the output*, not by the
+      kick/ext labels that turned out to be misleading — e.g.
+      `combine(first: &[u8], second: &[u8]) -> Result<Vec<u8>,
+      CombineError>` returning literally `first ++ second` after
+      validating each is 512 KiB and `is_kick`. The CLI crate is
+      responsible for mapping `romtool combine kick.rom ext.rom`'s
+      actual (reversed) byte order onto this unambiguous pair, with a
+      loud comment there explaining why — the confusion stays
+      contained to one documented call site instead of leaking into
+      this crate's naming.
+- [ ] **Patch framework** — docs confirm only **one** named built-in
+      patch exists: `1mb_rom`, "Patch Kickstart to support ext ROM
+      with 512 KiB" (pairs with `combine` above — it's what makes a
+      Kickstart recognize the resulting 1 MiB layout). **Corrects the
+      original draft**, which misremembered this as "1.x scsi.device
+      disable" — wrong, drop that reference. The crate still ships
+      only the *mechanism* (find/verify/replace with expected-bytes
+      safety, reseal via `seal_checksum` afterward) — not `1mb_rom`
+      itself: deriving its exact patch bytes/offsets independently
+      (without reading amitools' GPL source) is real reverse-engineering
+      work in its own right, not a quick re-derivation as the original
+      draft assumed. Treat shipping `1mb_rom`'s actual data as a
+      separate, later decision — same shape as the milestone-4
+      catalog-data question, not bundled into this pass.
 
 ## Milestone 6 — independent module-boundary detection (last, deliberately)
 
