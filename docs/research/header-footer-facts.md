@@ -408,3 +408,10 @@ Sweep method: the same from-scratch Python checks as §§1–6 (no GPL code
 involved), run over every `*.rom`/`*.bin` in the directory; images
 without the JMP header (A4091/A590/Picasso IV expansion ROMs, CD32 FMV
 module) skipped as expected non-Kickstart formats.
+
+One more §4 datapoint from milestone-2 review: kickety-split is
+variant-specific even within one OS release — the A500-class 2.04 ROM
+(`amiga-os-204.rom`) has `1111 4EF9` at its midpoint (romtool:
+`kickety_split ok`) while the A3000 2.04 build does not (`NOK`), both
+`is_kick ok`. Confirms "whatever bytes sit at that build's midpoint",
+per-machine-build, not per-release.

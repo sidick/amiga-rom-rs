@@ -288,7 +288,7 @@ deliberately does **not** state the offsets as if already known.
 `Loader` normalizes everything a user is likely to actually have.
 Ordered so each item's tests exist before or with it.
 
-- [ ] **Checksum verify + seal.** `verify_check_sum` wired to
+- [x] **Checksum verify + seal.** `verify_check_sum` wired to
       `checksum_ones_complement` and the confirmed stored-checksum
       offset; plus the write-side inverse now rather than in
       milestone 5 — `seal_checksum(rom: &mut [u8])` computing and
@@ -296,7 +296,7 @@ Ordered so each item's tests exist before or with it.
       trivial once the facts exist, every fixture needs the sealer,
       and it is this crate's `checksum_ok`/`seal_checksum` analogue:
       one primitive pair, no hand-rolled sums elsewhere.
-- [ ] **Header/footer/size-field checks + value reads**:
+- [x] **Header/footer/size-field checks + value reads**:
       `check_header`, `check_footer`, `check_size_field`,
       `read_check_sum`, `base_addr`, `boot_pc`, `rom_rev`,
       `exec_rev` — direct transcription of the milestone-1 facts
@@ -315,7 +315,7 @@ Ordered so each item's tests exist before or with it.
       romtool's size-dependent marker rule makes `check_header`
       report NOK on the genuine 1.4-beta ROM (`0x1111` at 512 KiB)
       — match romtool for parity, document the known false-negative.
-- [ ] **`check_kickety_split`, `check_magic_reset`, `is_kick_rom`**
+- [x] **`check_kickety_split`, `check_magic_reset`, `is_kick_rom`**
       per the confirmed facts. The conjunction is now settled by
       oracle (milestone 1 §4/§5): `is_kick` = size ∧ header ∧ footer
       ∧ (size field == actual length) ∧ checksum — **neither
@@ -333,24 +333,24 @@ Ordered so each item's tests exist before or with it.
       field against pinned amitools `romtool info` over the synthetic
       fixtures (valid, wrong-size, corrupted-checksum, no-footer …),
       wired into CI exactly like the rdb crate's rdbtool harness.
-- [ ] **Byte-order detect + reorder.** `Loader::detect` over the
+- [x] **Byte-order detect + reorder.** `Loader::detect` over the
       signature table under all four permutations;
       `Loader::normalize` reordering to canonical. Property tests:
       reorder is self-inverse for 1032/2301/3210, round-trips for
       all four, detect(normalize(x)) == Normal, and every
       permutation of a valid fixture detects correctly.
-- [ ] **Cloanto decode, finished.** Exact framing from milestone 1
+- [x] **Cloanto decode, finished.** Exact framing from milestone 1
       replaces the current banner-prefix approximation (payload
       extent, footer trim — the current decoder's "caller trims the
       footer" note is a stub-era wart that goes away here). Key
       errors distinguished: `KeyRequired` vs an empty key
       (`InvalidKey`, replacing the current `debug_assert`). Synthetic
       encode→decode round-trip test; env-gated real-key test.
-- [ ] **`merge_hi_lo`/`split_hi_lo`** per the confirmed interleave;
+- [x] **`merge_hi_lo`/`split_hi_lo`** per the confirmed interleave;
       split→merge round-trip property test; `LoaderError` variants
       for size mismatches settled (`MismatchedHiLoLength` exists;
       likely add odd-size / not-a-ROM-size).
-- [ ] **Error shape audit.** `LoaderError::NotYetImplemented` is
+- [x] **Error shape audit.** `LoaderError::NotYetImplemented` is
       deleted (it exists only to keep stubs honest); remaining
       variants reviewed against "every failure a caller can act on
       is distinguishable"; `Display` for all, `std::error::Error`

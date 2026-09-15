@@ -31,14 +31,15 @@
 //! byte-order signature table, Cloanto framing, hi/lo interleave — is
 //! confirmed and recorded in `docs/research/` and `PLAN.md`, proven by
 //! a synthetic fixture (`fixtures::synthetic_rom`, test-only) that
-//! amitools' `romtool` accepts as `is_kick: ok`. The [`KickRom`] check/
-//! value methods and the byte-order leg of [`Loader::detect`]/
-//! [`Loader::normalize`] remain `todo!()` stubs until milestone 2
-//! transcribes those facts into the public API — the API shape is
-//! fixed, and nothing here reports a false "ok". What *is* implemented
-//! — ROM size checks, Cloanto container detection + decode (the
-//! `AMIROMTYPE1` framing), and the ones'-complement-fold checksum
-//! primitive — is real.
+//! amitools' `romtool` accepts as `is_kick: ok`. Milestone 2's core is
+//! now real on both sides: every [`KickRom`] check/value method
+//! transcribes the confirmed facts (bounds-checked, panic-free on any
+//! input; value methods return `Option`), [`seal_checksum`] is the
+//! public checksum-writing counterpart, and the loader is complete —
+//! byte-order detection/reordering over the confirmed signature table,
+//! Cloanto decode, and the hi/lo EPROM word-interleave. No `todo!()`
+//! remains; the differential-oracle harness and fuzzing are the
+//! outstanding milestone-2 items.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -92,11 +93,23 @@ pub enum LoaderError {
     /// [`RomEncoding::CloantoEncoded`] was detected or forced, but no key
     /// was supplied to [`Loader::normalize`].
     KeyRequired,
-    /// The byte-order leg of detection/normalization isn't implemented
-    /// yet — see this crate's `PLAN.md` milestone-1 facts pass.
-    NotYetImplemented,
+    /// A key was supplied to decode a [`RomEncoding::CloantoEncoded`]
+    /// image, but it was empty (cycling XOR against an empty key is
+    /// undefined — there's no byte to cycle).
+    InvalidKey,
+    /// [`Loader::detect`] could not classify the data as any known ROM
+    /// format (no boot-vector signature matched under any byte order,
+    /// and the Cloanto magic wasn't present).
+    UnknownFormat,
+    /// A byte-reordering operation ([`Loader::normalize`]'s raw leg, or
+    /// [`split_hi_lo`]) was given data whose length isn't a multiple of
+    /// 4 bytes, so it can't be split into whole 4-byte groups.
+    UnalignedLength,
     /// [`merge_hi_lo`] was given two images of different lengths.
     MismatchedHiLoLength,
+    /// [`merge_hi_lo`] was given hi/lo images of odd length, so they
+    /// can't be split into whole 16-bit words.
+    OddHiLoLength,
 }
 
 impl fmt::Display for LoaderError {
@@ -105,14 +118,23 @@ impl fmt::Display for LoaderError {
             LoaderError::KeyRequired => {
                 write!(f, "Cloanto-encoded ROM: a rom.key is required to decode it")
             }
-            LoaderError::NotYetImplemented => {
+            LoaderError::InvalidKey => {
+                write!(f, "Cloanto rom.key must not be empty")
+            }
+            LoaderError::UnknownFormat => {
                 write!(
                     f,
-                    "not yet implemented — see PLAN.md's milestone-1 facts pass"
+                    "data does not match any known ROM format (byte-order signature or Cloanto magic)"
                 )
+            }
+            LoaderError::UnalignedLength => {
+                write!(f, "ROM image length must be a multiple of 4 bytes")
             }
             LoaderError::MismatchedHiLoLength => {
                 write!(f, "hi and lo EPROM images must be the same length")
+            }
+            LoaderError::OddHiLoLength => {
+                write!(f, "hi and lo EPROM images must have even length")
             }
         }
     }
@@ -120,6 +142,51 @@ impl fmt::Display for LoaderError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for LoaderError {}
+
+/// Boot-vector signature table for byte-order detection: the four
+/// *distinct* first longwords (big-endian, canonical order) transcribed
+/// from kicksmash32's `detect_byte_order()` table
+/// (`sw/hostsmash.c:2008-2016` at commit `a343550`, BSD-2-Clause). Two
+/// kicksmash32 rows share `11144ef9` (Kickstart 2.04+ and the ROM
+/// Switcher) and two share `11114ef9` (Kickstart 1.3, Logica-Dialoga,
+/// and AROS); only the distinct values are kept here since detection
+/// matches on this longword alone (see [`Loader::detect`]'s doc comment
+/// for why the second longword is shape-checked, not exact-matched).
+const SIG_LW0: [([u8; 4], &str); 4] = [
+    ([0x11, 0x14, 0x4E, 0xF9], "Kickstart 2.04+ / ROM Switcher"),
+    (
+        [0x11, 0x11, 0x4E, 0xF9],
+        "Kickstart 1.3 / Logica-Dialoga / AROS",
+    ),
+    ([0x61, 0x2E, 0x44, 0x47], "DiagROM 2.x Beta"),
+    ([0x11, 0x14, 0x44, 0x47], "DiagROM 2.x"),
+];
+
+/// The four detectable/settable byte-order permutations, in a fixed
+/// order used by [`Loader::detect`]'s search.
+const PERMUTATIONS: [ByteOrder; 4] = [
+    ByteOrder::Normal,
+    ByteOrder::Order1032,
+    ByteOrder::Order2301,
+    ByteOrder::Order3210,
+];
+
+/// Applies `order` to one 4-byte group (`word[0]` = the lowest file
+/// offset), per the exact byte-index semantics confirmed in
+/// `docs/research/byte-order-facts.md` §2.
+///
+/// Every one of these four permutations is its own inverse — applying
+/// the same `order` twice returns the original bytes — so this single
+/// function serves both directions (canonical→raw and raw→canonical)
+/// with no separate inverse table needed.
+const fn permute_word(word: [u8; 4], order: ByteOrder) -> [u8; 4] {
+    match order {
+        ByteOrder::Normal => word,
+        ByteOrder::Order1032 => [word[1], word[0], word[3], word[2]],
+        ByteOrder::Order2301 => [word[2], word[3], word[0], word[1]],
+        ByteOrder::Order3210 => [word[3], word[2], word[1], word[0]],
+    }
+}
 
 /// Normalizes a raw ROM file's bytes into a canonical image.
 pub struct Loader;
@@ -130,41 +197,81 @@ impl Loader {
     /// `AMIROMTYPE1` container magic), and classifies. Does not
     /// decode/reorder — see [`Loader::normalize`] for that.
     ///
-    /// Cloanto detection is implemented (an 11-byte fixed magic,
-    /// confirmed sufficient and reliable — see
-    /// `docs/research/cloanto-hilo-facts.md`). Byte-order detection is
-    /// not yet — the signature table is confirmed
-    /// (`docs/research/byte-order-facts.md`) but lands with milestone 2.
+    /// Returns `None` when `data` doesn't match anything recognized —
+    /// too short (fewer than 8 bytes, unless it matches the Cloanto
+    /// magic, which only needs its own 11 bytes), or its first longword
+    /// doesn't match the boot-vector signature table under any
+    /// permutation.
     ///
-    /// # Panics
-    ///
-    /// Panics with `todo!()` when `data` doesn't match the Cloanto
-    /// magic, since the byte-order leg isn't implemented yet.
-    pub fn detect(data: &[u8]) -> RomEncoding {
+    /// Matching proceeds: for each table entry and each permutation,
+    /// compare the image's raw first big-endian `u32` against the
+    /// table value permuted that way. On a match, the *second* longword
+    /// (similarly un-permuted back to canonical order) must additionally
+    /// look like a plausible ROM-space address — high byte `0x00`,
+    /// second byte in `0xF0..=0xFF` (covering the confirmed real bases
+    /// `F8`/`FC`/`F0`/`FF`). This is deliberately neither of
+    /// kicksmash32's two behaviours (exact-matching the pair, or
+    /// ignoring the second longword entirely): an exact-value check on
+    /// the second longword would wrongly reject unknown ROM builds
+    /// whose boot PC isn't one of the sampled values, while skipping it
+    /// entirely would accept any four bytes that happen to share a
+    /// first longword with a real ROM family. See `PLAN.md`'s
+    /// "Boot-vector signature table" milestone-1 item for the full
+    /// rationale.
+    pub fn detect(data: &[u8]) -> Option<RomEncoding> {
         if data.starts_with(CLOANTO_MAGIC) {
-            return RomEncoding::CloantoEncoded;
+            return Some(RomEncoding::CloantoEncoded);
         }
-        todo!(
-            "byte-order detection needs a verified known-boot-vector table; \
-             see PLAN.md's milestone-1 facts pass"
-        )
+        if data.len() < 8 {
+            return None;
+        }
+        let lw0 = [data[0], data[1], data[2], data[3]];
+        let lw1 = [data[4], data[5], data[6], data[7]];
+        for &(sig, _family) in SIG_LW0.iter() {
+            for &order in PERMUTATIONS.iter() {
+                if lw0 != permute_word(sig, order) {
+                    continue;
+                }
+                let canon_lw1 = permute_word(lw1, order);
+                if canon_lw1[0] == 0x00 && (0xF0..=0xFF).contains(&canon_lw1[1]) {
+                    return Some(RomEncoding::Raw(order));
+                }
+            }
+        }
+        None
     }
 
     /// Normalizes `data` into a canonical raw image. `key` is required
     /// iff [`RomEncoding::CloantoEncoded`] is detected.
     ///
-    /// # Panics
-    ///
-    /// Panics with `todo!()` on the [`ByteOrder`] leg — not yet
-    /// implemented, see [`Loader::detect`].
+    /// Errors: [`LoaderError::UnknownFormat`] if [`Loader::detect`]
+    /// can't classify `data` at all; [`LoaderError::KeyRequired`] /
+    /// [`LoaderError::InvalidKey`] for a missing/empty Cloanto key;
+    /// [`LoaderError::UnalignedLength`] if a non-[`ByteOrder::Normal`]
+    /// raw image's length isn't a multiple of 4 bytes (reordering is
+    /// only defined on whole 4-byte groups — a trailing partial group
+    /// can't occur for a genuinely swapped dump of a real ROM, since
+    /// canonical sizes are themselves multiples of 4, but a caller can
+    /// still hand in arbitrary bytes).
     pub fn normalize(data: &[u8], key: Option<&[u8]>) -> Result<Vec<u8>, LoaderError> {
         match Self::detect(data) {
-            RomEncoding::CloantoEncoded => {
+            Some(RomEncoding::CloantoEncoded) => {
                 let key = key.ok_or(LoaderError::KeyRequired)?;
                 decode_cloanto(data, key)
             }
-            RomEncoding::Raw(ByteOrder::Normal) => Ok(data.to_vec()),
-            RomEncoding::Raw(_) => Err(LoaderError::NotYetImplemented),
+            Some(RomEncoding::Raw(ByteOrder::Normal)) => Ok(data.to_vec()),
+            Some(RomEncoding::Raw(order)) => {
+                if data.len() % 4 != 0 {
+                    return Err(LoaderError::UnalignedLength);
+                }
+                let mut out = Vec::with_capacity(data.len());
+                for chunk in data.chunks_exact(4) {
+                    let word = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                    out.extend_from_slice(&permute_word(word, order));
+                }
+                Ok(out)
+            }
+            None => Err(LoaderError::UnknownFormat),
         }
     }
 }
@@ -176,7 +283,9 @@ impl Loader {
 /// nothing to trim (confirmed against real Amiga Forever ROMs; see
 /// `docs/research/cloanto-hilo-facts.md`).
 fn decode_cloanto(data: &[u8], key: &[u8]) -> Result<Vec<u8>, LoaderError> {
-    debug_assert!(!key.is_empty(), "caller must supply a non-empty key");
+    if key.is_empty() {
+        return Err(LoaderError::InvalidKey);
+    }
     let payload = &data[CLOANTO_MAGIC.len()..];
     let mut out = Vec::with_capacity(payload.len());
     for (i, &b) in payload.iter().enumerate() {
@@ -185,28 +294,54 @@ fn decode_cloanto(data: &[u8], key: &[u8]) -> Result<Vec<u8>, LoaderError> {
     Ok(out)
 }
 
-/// Merges two same-size hi/lo EPROM dumps into one canonical image.
+/// Merges two same-size hi/lo EPROM dumps into one canonical image: for
+/// each output 32-bit longword, the hi file supplies the first 16-bit
+/// word (bytes `b0 b1`) and the lo file supplies the second (`b2 b3`) —
+/// pure canonical word-interleave, confirmed against AmigaROMUtil (MIT)
+/// in `docs/research/cloanto-hilo-facts.md` §B1. No byte-swapping is
+/// baked in here: the burner convention of swapping to `1032` order
+/// before interleaving composes separately via [`Loader::normalize`]/
+/// [`ByteOrder`], keeping the two axes orthogonal (rationale in
+/// `PLAN.md`'s "Hi/lo EPROM interleave width" milestone-1 item).
 ///
-/// # Panics
-///
-/// Panics with `todo!()` — the hi/lo interleave width (byte vs
-/// 16-bit-word split) hasn't been confirmed against a real sample yet;
-/// see `PLAN.md`'s loader section.
+/// Errors if `hi`/`lo` differ in length, or if their (common) length is
+/// odd — each is a sequence of whole 16-bit words.
 pub fn merge_hi_lo(hi: &[u8], lo: &[u8]) -> Result<Vec<u8>, LoaderError> {
     if hi.len() != lo.len() {
         return Err(LoaderError::MismatchedHiLoLength);
     }
-    todo!("hi/lo interleave width not yet confirmed; see PLAN.md's loader section")
+    if hi.len() % 2 != 0 {
+        return Err(LoaderError::OddHiLoLength);
+    }
+    let mut out = Vec::with_capacity(hi.len() + lo.len());
+    for i in (0..hi.len()).step_by(2) {
+        out.push(hi[i]);
+        out.push(hi[i + 1]);
+        out.push(lo[i]);
+        out.push(lo[i + 1]);
+    }
+    Ok(out)
 }
 
 /// Inverse of [`merge_hi_lo`]: splits a canonical image into hi/lo EPROM
-/// dumps.
+/// dumps, per the same 16-bit-word interleave (hi = `b0 b1` of each
+/// longword, lo = `b2 b3`).
 ///
-/// # Panics
-///
-/// Panics with `todo!()` — see [`merge_hi_lo`].
-pub fn split_hi_lo(_rom: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    todo!("hi/lo interleave width not yet confirmed; see PLAN.md's loader section")
+/// Errors with [`LoaderError::UnalignedLength`] if `rom.len()` isn't a
+/// multiple of 4 — the interleave operates on whole 32-bit longwords.
+pub fn split_hi_lo(rom: &[u8]) -> Result<(Vec<u8>, Vec<u8>), LoaderError> {
+    if rom.len() % 4 != 0 {
+        return Err(LoaderError::UnalignedLength);
+    }
+    let mut hi = Vec::with_capacity(rom.len() / 2);
+    let mut lo = Vec::with_capacity(rom.len() / 2);
+    for chunk in rom.chunks_exact(4) {
+        hi.push(chunk[0]);
+        hi.push(chunk[1]);
+        lo.push(chunk[2]);
+        lo.push(chunk[3]);
+    }
+    Ok((hi, lo))
 }
 
 /// Sums every big-endian 32-bit longword in `data` with ones'-complement
@@ -252,70 +387,134 @@ impl<'a> KickRom<'a> {
     }
 
     /// `true` iff a valid Kickstart ROM header is found at the start of
-    /// the image.
+    /// the image (`docs/research/header-footer-facts.md` §1).
     ///
-    /// # Panics
+    /// The marker word at offset 0x00 must be either `0x1114` (accepted
+    /// at any size) or `0x1111` — but `0x1111` is accepted only when the
+    /// image is exactly [`ROM_SIZE_256K`], matching `romtool`'s
+    /// size-dependent rule (oracle-confirmed: `0x1111` at 512 KiB is
+    /// rejected). The word at offset 0x02 must be exactly `0x4EF9`
+    /// (`JMP abs.L`). **Known false negative** (§1 addendum): this
+    /// rejects the genuine Kickstart 1.4-beta ROM, which carries
+    /// `0x1111` at 512 KiB — matched here deliberately for parity with
+    /// `romtool`, not a bug in this crate.
     ///
-    /// Always panics with `todo!()` — the header layout isn't nailed
-    /// down yet; see `PLAN.md`'s milestone-1 facts pass.
+    /// Returns `false` (never panics) on any image shorter than 0x18
+    /// bytes.
     pub fn check_header(&self) -> bool {
-        todo!("Kickstart header layout not yet confirmed; see PLAN.md's milestone-1 facts pass")
+        if self.data.len() < 0x18 {
+            return false;
+        }
+        let marker = u16::from_be_bytes([self.data[0x00], self.data[0x01]]);
+        let opcode = u16::from_be_bytes([self.data[0x02], self.data[0x03]]);
+        let marker_ok = marker == 0x1114 || (marker == 0x1111 && self.data.len() == ROM_SIZE_256K);
+        marker_ok && opcode == 0x4EF9
     }
 
     /// `true` iff a valid Kickstart ROM footer is found at the end of
-    /// the image.
+    /// the image (`docs/research/header-footer-facts.md` §2).
     ///
-    /// # Panics
+    /// Validates the seven trailing u16 words at `len-14..len-1`
+    /// against `0x0019..0x001F`. The word at `len-16` is deliberately
+    /// **not** checked — real 1.3 ROMs carry `0xFFC0` there and still
+    /// pass, per the oracle isolation in §2.
     ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
+    /// Returns `false` (never panics) on any image shorter than 24
+    /// bytes.
     pub fn check_footer(&self) -> bool {
-        todo!("Kickstart footer layout not yet confirmed; see PLAN.md's milestone-1 facts pass")
+        let len = self.data.len();
+        if len < 24 {
+            return false;
+        }
+        const EXPECTED: [u16; 7] = [0x0019, 0x001A, 0x001B, 0x001C, 0x001D, 0x001E, 0x001F];
+        for (i, &want) in EXPECTED.iter().enumerate() {
+            let off = len - 14 + i * 2;
+            let word = u16::from_be_bytes([self.data[off], self.data[off + 1]]);
+            if word != want {
+                return false;
+            }
+        }
+        true
     }
 
-    /// `true` iff the footer's size field matches the image's actual
-    /// length.
+    /// `true` iff the footer's size field (u32 at `len-20`) equals the
+    /// image's actual length (`docs/research/header-footer-facts.md`
+    /// §2).
     ///
-    /// # Panics
+    /// This implements the *true* semantics of the field: `romtool`'s
+    /// printed `size_field` line is cosmetic and never goes NOK under
+    /// any mutation (oracle-confirmed), even though `is_kick` silently
+    /// depends on this equality. This method is honest — it reports the
+    /// real comparison, matching what `is_kick_rom` needs.
     ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
+    /// Returns `false` (never panics) on any image shorter than 24
+    /// bytes.
     pub fn check_size_field(&self) -> bool {
-        todo!("Kickstart footer layout not yet confirmed; see PLAN.md's milestone-1 facts pass")
+        let len = self.data.len();
+        if len < 24 {
+            return false;
+        }
+        let off = len - 20;
+        let field = u32::from_be_bytes([
+            self.data[off],
+            self.data[off + 1],
+            self.data[off + 2],
+            self.data[off + 3],
+        ]);
+        field as usize == len
     }
 
-    /// `true` iff the stored checksum matches
-    /// [`checksum_ones_complement`]'s result (folding to `0xFFFFFFFF`).
+    /// `true` iff the image's length is a nonzero multiple of 4 and at
+    /// least 24 bytes, and [`checksum_ones_complement`] over the whole
+    /// image folds to `0xFFFFFFFF` (`docs/research/header-footer-facts.md`
+    /// §3).
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — the stored checksum word's offset
-    /// isn't confirmed yet; see `PLAN.md`'s milestone-1 facts pass. The
-    /// underlying arithmetic ([`checksum_ones_complement`]) is already
-    /// implemented.
+    /// Returns `false` (never panics) on any image that fails the
+    /// length preconditions.
     pub fn verify_check_sum(&self) -> bool {
-        todo!(
-            "stored checksum word offset not yet confirmed; \
-             see PLAN.md's milestone-1 facts pass"
-        )
+        let len = self.data.len();
+        if len == 0 || len < 24 || len % 4 != 0 {
+            return false;
+        }
+        checksum_ones_complement(self.data) == 0xFFFF_FFFF
     }
 
-    /// `true` iff the "kickety split" signature (an extra 256 KiB
-    /// module, found in some 512 KiB ROMs) is present.
+    /// `true` iff the "kickety split" signature — a second copy of the
+    /// marker word + `JMP` opcode at the image's exact midpoint
+    /// (`docs/research/header-footer-facts.md` §4) — is present.
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
+    /// Stricter than [`KickRom::check_header`]: only marker `0x1111` is
+    /// accepted at the midpoint (not `0x1114`), matching the oracle
+    /// result. The address word following the opcode is not checked.
+    /// Requires an even length; returns `false` (never panics) on any
+    /// image too short to hold the two words at `len/2`.
     pub fn check_kickety_split(&self) -> bool {
-        todo!("kickety-split signature not yet confirmed; see PLAN.md's milestone-1 facts pass")
+        let len = self.data.len();
+        if len == 0 || len % 2 != 0 {
+            return false;
+        }
+        let mid = len / 2;
+        if mid + 4 > len {
+            return false;
+        }
+        let marker = u16::from_be_bytes([self.data[mid], self.data[mid + 1]]);
+        let opcode = u16::from_be_bytes([self.data[mid + 2], self.data[mid + 3]]);
+        marker == 0x1111 && opcode == 0x4EF9
     }
 
-    /// `true` iff the magic reset opcode is present at its expected
-    /// location.
+    /// `true` iff the m68k `RESET` opcode (`0x4E70`) is present at the
+    /// fixed absolute offset `0xD0`
+    /// (`docs/research/header-footer-facts.md` §5), independent of
+    /// `boot_pc`/`base_addr`.
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
+    /// Returns `false` (never panics) on any image shorter than 0xD2
+    /// bytes.
     pub fn check_magic_reset(&self) -> bool {
-        todo!("magic-reset opcode location not yet confirmed; see PLAN.md's milestone-1 facts pass")
+        const RESET_OFFSET: usize = 0xD0;
+        if self.data.len() < RESET_OFFSET + 2 {
+            return false;
+        }
+        u16::from_be_bytes([self.data[RESET_OFFSET], self.data[RESET_OFFSET + 1]]) == 0x4E70
     }
 
     /// `true` iff the image passes every check that gates "is a
@@ -323,10 +522,6 @@ impl<'a> KickRom<'a> {
     /// Kickety-split and magic-reset are informational and
     /// deliberately *not* part of this conjunction — confirmed by
     /// oracle (`docs/research/header-footer-facts.md` §4/§5).
-    ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
     pub fn is_kick_rom(&self) -> bool {
         self.check_size()
             && self.check_header()
@@ -335,65 +530,84 @@ impl<'a> KickRom<'a> {
             && self.verify_check_sum()
     }
 
-    /// Reads the stored checksum value from the footer.
+    /// Reads the stored checksum value (u32 at `len-24`) from the
+    /// footer (`docs/research/header-footer-facts.md` §3).
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
-    pub fn read_check_sum(&self) -> u32 {
-        todo!(
-            "stored checksum word offset not yet confirmed; \
-             see PLAN.md's milestone-1 facts pass"
-        )
+    /// Returns `None` on any image shorter than 24 bytes.
+    pub fn read_check_sum(&self) -> Option<u32> {
+        let len = self.data.len();
+        if len < 24 {
+            return None;
+        }
+        let off = len - 24;
+        Some(u32::from_be_bytes([
+            self.data[off],
+            self.data[off + 1],
+            self.data[off + 2],
+            self.data[off + 3],
+        ]))
     }
 
-    /// The ROM's base address in the Amiga's memory map.
+    /// The ROM's base address in the Amiga's memory map, derived (never
+    /// looked up) as `boot_pc & 0xFFFF0000`
+    /// (`docs/research/header-footer-facts.md` §1).
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
-    pub fn base_addr(&self) -> u32 {
-        todo!("ROM header layout not yet confirmed; see PLAN.md's milestone-1 facts pass")
+    /// Returns `None` on any image shorter than 0x18 bytes.
+    pub fn base_addr(&self) -> Option<u32> {
+        self.boot_pc().map(|pc| pc & 0xFFFF_0000)
     }
 
-    /// The boot program counter (the reset vector's target).
+    /// The boot program counter — the u32 `JMP` target at header offset
+    /// 0x04, which *is* the whole first instruction
+    /// (`docs/research/header-footer-facts.md` §1).
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
-    pub fn boot_pc(&self) -> u32 {
-        todo!("ROM header layout not yet confirmed; see PLAN.md's milestone-1 facts pass")
+    /// Returns `None` on any image shorter than 0x18 bytes.
+    pub fn boot_pc(&self) -> Option<u32> {
+        if self.data.len() < 0x18 {
+            return None;
+        }
+        Some(u32::from_be_bytes([
+            self.data[0x04],
+            self.data[0x05],
+            self.data[0x06],
+            self.data[0x07],
+        ]))
     }
 
-    /// The ROM's (major, minor) revision.
+    /// The ROM's (major, minor) revision, read from header offset 0x0C
+    /// (`docs/research/header-footer-facts.md` §1). Note the §1
+    /// addendum: pre-1.2 ROMs carry an unpopulated `(0xFFFF, 0xFFFF)`
+    /// here — this method returns that value as-is, without inventing
+    /// meaning for it.
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
-    pub fn rom_rev(&self) -> (u16, u16) {
-        todo!("ROM header layout not yet confirmed; see PLAN.md's milestone-1 facts pass")
+    /// Returns `None` on any image shorter than 0x18 bytes.
+    pub fn rom_rev(&self) -> Option<(u16, u16)> {
+        if self.data.len() < 0x18 {
+            return None;
+        }
+        Some((
+            u16::from_be_bytes([self.data[0x0C], self.data[0x0D]]),
+            u16::from_be_bytes([self.data[0x0E], self.data[0x0F]]),
+        ))
     }
 
-    /// The embedded Exec's (major, minor) revision.
+    /// The embedded Exec's (major, minor) revision, read from the fixed
+    /// header offset 0x10 — not resident-derived (proven by oracle,
+    /// `docs/research/header-footer-facts.md` §6).
     ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` — see [`KickRom::check_header`].
-    /// The source is settled: a fixed read at header offset 0x10, not
-    /// resident-derived (proven by oracle,
-    /// `docs/research/header-footer-facts.md` §6) — lands with the
-    /// other milestone-2 offset reads.
-    pub fn exec_rev(&self) -> (u16, u16) {
-        todo!("header reads land with milestone 2; see PLAN.md")
+    /// Returns `None` on any image shorter than 0x18 bytes.
+    pub fn exec_rev(&self) -> Option<(u16, u16)> {
+        if self.data.len() < 0x18 {
+            return None;
+        }
+        Some((
+            u16::from_be_bytes([self.data[0x10], self.data[0x11]]),
+            u16::from_be_bytes([self.data[0x12], self.data[0x13]]),
+        ))
     }
 
     /// Aggregates every check/value into one [`RomInfo`], matching
     /// `romtool info`'s field set.
-    ///
-    /// # Panics
-    ///
-    /// Always panics with `todo!()` until the checks above are
-    /// implemented — see [`KickRom::check_header`].
     pub fn info(&self) -> RomInfo {
         RomInfo {
             size_ok: self.check_size(),
@@ -413,8 +627,62 @@ impl<'a> KickRom<'a> {
     }
 }
 
+/// Errors from [`seal_checksum`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealError {
+    /// The image is shorter than the 24-byte footer that holds the
+    /// checksum word.
+    TooShort,
+    /// The image length is not a multiple of 4, so it cannot be summed
+    /// as consecutive big-endian longwords.
+    NotLongwordAligned,
+}
+
+impl fmt::Display for SealError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SealError::TooShort => {
+                write!(f, "image is shorter than the 24-byte checksum footer")
+            }
+            SealError::NotLongwordAligned => {
+                write!(f, "image length is not a multiple of 4")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SealError {}
+
+/// Seals `rom`'s stored checksum: zeroes the u32 at `len-24`, computes
+/// [`checksum_ones_complement`] over the whole image, and stores the
+/// bitwise complement of that sum back at `len-24` — the inverse of
+/// [`KickRom::verify_check_sum`]
+/// (`docs/research/header-footer-facts.md` §3). Always routes through
+/// [`checksum_ones_complement`], never a hand-rolled sum.
+///
+/// # Errors
+///
+/// [`SealError::TooShort`] if `rom.len() < 24`;
+/// [`SealError::NotLongwordAligned`] if `rom.len() % 4 != 0`.
+pub fn seal_checksum(rom: &mut [u8]) -> Result<(), SealError> {
+    let len = rom.len();
+    if len < 24 {
+        return Err(SealError::TooShort);
+    }
+    if len % 4 != 0 {
+        return Err(SealError::NotLongwordAligned);
+    }
+    let checksum_off = len - 24;
+    rom[checksum_off..checksum_off + 4].copy_from_slice(&0u32.to_be_bytes());
+    let sum = checksum_ones_complement(rom);
+    rom[checksum_off..checksum_off + 4].copy_from_slice(&(!sum).to_be_bytes());
+    Ok(())
+}
+
 /// The aggregate result of every [`KickRom`] check, matching `romtool
-/// info`'s field set.
+/// info`'s field set. Value fields are `None` exactly when the image is
+/// too short to contain that field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RomInfo {
     pub size_ok: bool,
@@ -425,11 +693,11 @@ pub struct RomInfo {
     pub kickety_split_ok: bool,
     pub magic_reset_ok: bool,
     pub is_kick: bool,
-    pub check_sum: u32,
-    pub base_addr: u32,
-    pub boot_pc: u32,
-    pub rom_rev: (u16, u16),
-    pub exec_rev: (u16, u16),
+    pub check_sum: Option<u32>,
+    pub base_addr: Option<u32>,
+    pub boot_pc: Option<u32>,
+    pub rom_rev: Option<(u16, u16)>,
+    pub exec_rev: Option<(u16, u16)>,
 }
 
 /// Test-only synthetic Kickstart image fixtures — never ships real ROM
@@ -574,13 +842,9 @@ mod fixtures {
             put_u16(&mut data, vectors_off + i * 2, word);
         }
 
-        // --- Checksum seal (§3): end-around-carry sum of the whole
-        // image, with the checksum field zeroed, complemented and
-        // stored back. Routed through checksum_ones_complement per
-        // PLAN.md's rule against hand-rolled arithmetic.
-        let partial_sum = checksum_ones_complement(&data);
-        let sealed = !partial_sum;
-        put_u32(&mut data, checksum_off, sealed);
+        // --- Checksum seal (§3), via the public sealer — no hand-rolled
+        // arithmetic here, per PLAN.md's rule.
+        seal_checksum(&mut data).expect("fixture image is always >= 24 bytes and 4-aligned");
 
         debug_assert_eq!(checksum_ones_complement(&data), 0xFFFF_FFFF);
         data
@@ -607,7 +871,189 @@ mod tests {
     fn detect_recognizes_cloanto_magic() {
         let mut data = CLOANTO_MAGIC.to_vec();
         data.extend_from_slice(&[0u8; 16]);
-        assert_eq!(Loader::detect(&data), RomEncoding::CloantoEncoded);
+        assert_eq!(Loader::detect(&data), Some(RomEncoding::CloantoEncoded));
+    }
+
+    /// The Cloanto magic takes priority regardless of what follows it —
+    /// even bytes that would otherwise look like junk.
+    #[test]
+    fn detect_recognizes_cloanto_magic_regardless_of_payload() {
+        let mut data = CLOANTO_MAGIC.to_vec();
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(Loader::detect(&data), Some(RomEncoding::CloantoEncoded));
+    }
+
+    /// A canonical-order boot vector (Kickstart 2.04+ family: LW0
+    /// `11144ef9`, LW1 a plausible `$00F8xxxx` boot PC).
+    const NORMAL_HEADER: [u8; 8] = [0x11, 0x14, 0x4E, 0xF9, 0x00, 0xF8, 0x00, 0xD2];
+
+    #[test]
+    fn detect_recognizes_normal_order_header() {
+        assert_eq!(
+            Loader::detect(&NORMAL_HEADER),
+            Some(RomEncoding::Raw(ByteOrder::Normal))
+        );
+    }
+
+    #[test]
+    fn detect_recognizes_every_permutation_of_a_valid_header() {
+        for &order in PERMUTATIONS.iter() {
+            let mut permuted = Vec::new();
+            for chunk in NORMAL_HEADER.chunks_exact(4) {
+                let word = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                permuted.extend_from_slice(&permute_word(word, order));
+            }
+            assert_eq!(
+                Loader::detect(&permuted),
+                Some(RomEncoding::Raw(order)),
+                "order {order:?} round-trip failed"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_recognizes_all_four_signature_table_values() {
+        // Second longwords chosen as plausible ROM-space addresses for
+        // each family per docs/research/byte-order-facts.md.
+        let headers: [[u8; 8]; 4] = [
+            [0x11, 0x14, 0x4E, 0xF9, 0x00, 0xF8, 0x00, 0xD2], // Kickstart 2.04+
+            [0x11, 0x11, 0x4E, 0xF9, 0x00, 0xFC, 0x00, 0xD2], // Kickstart 1.3
+            [0x61, 0x2E, 0x44, 0x47, 0x00, 0xF8, 0x01, 0x90], // DiagROM 2.x Beta
+            [0x11, 0x14, 0x44, 0x47, 0x00, 0xF8, 0x00, 0xD6], // DiagROM 2.x
+        ];
+        for header in headers.iter() {
+            assert_eq!(
+                Loader::detect(header),
+                Some(RomEncoding::Raw(ByteOrder::Normal)),
+                "header {header:02x?} not recognized"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_rejects_junk() {
+        let junk = [0xAAu8; 16];
+        assert_eq!(Loader::detect(&junk), None);
+    }
+
+    #[test]
+    fn detect_rejects_valid_lw0_with_implausible_lw1() {
+        let mut data = NORMAL_HEADER;
+        // Replace LW1 with something that isn't a plausible ROM-space
+        // address (high byte non-zero).
+        data[4..8].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(Loader::detect(&data), None);
+    }
+
+    #[test]
+    fn detect_rejects_short_input() {
+        assert_eq!(Loader::detect(&[]), None);
+        assert_eq!(Loader::detect(&[0x11, 0x14, 0x4E]), None);
+        assert_eq!(Loader::detect(&NORMAL_HEADER[..7]), None);
+    }
+
+    #[test]
+    fn permute_word_permutations_are_self_inverse() {
+        let word = [0x12, 0x34, 0x56, 0x78];
+        for &order in PERMUTATIONS.iter() {
+            let once = permute_word(word, order);
+            let twice = permute_word(once, order);
+            assert_eq!(twice, word, "order {order:?} is not self-inverse");
+        }
+    }
+
+    /// Synthetic 16-byte image (4 longwords) built from the canonical
+    /// `NORMAL_HEADER` plus filler, used to exercise normalize's raw
+    /// reordering leg without touching the `fixtures` module (owned by
+    /// a parallel worker).
+    fn synthetic_canonical_image() -> Vec<u8> {
+        let mut data = NORMAL_HEADER.to_vec();
+        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+        data
+    }
+
+    #[test]
+    fn normalize_round_trips_every_permutation_of_a_synthetic_image() {
+        let canonical = synthetic_canonical_image();
+        for &order in PERMUTATIONS.iter() {
+            let mut permuted = Vec::new();
+            for chunk in canonical.chunks_exact(4) {
+                let word = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                permuted.extend_from_slice(&permute_word(word, order));
+            }
+            let normalized = Loader::normalize(&permuted, None).unwrap();
+            assert_eq!(
+                normalized, canonical,
+                "order {order:?} did not normalize back to canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_returns_unknown_format_for_junk() {
+        let junk = [0xAAu8; 16];
+        assert_eq!(
+            Loader::normalize(&junk, None),
+            Err(LoaderError::UnknownFormat)
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_unaligned_swapped_length() {
+        // A valid, swapped 8-byte header (Order1032) followed by 3
+        // extra bytes: not a multiple of 4, so reordering can't proceed.
+        let mut swapped = Vec::new();
+        for chunk in NORMAL_HEADER.chunks_exact(4) {
+            let word = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            swapped.extend_from_slice(&permute_word(word, ByteOrder::Order1032));
+        }
+        swapped.extend_from_slice(&[0x00, 0x00, 0x00]);
+        assert_eq!(
+            Loader::normalize(&swapped, None),
+            Err(LoaderError::UnalignedLength)
+        );
+    }
+
+    #[test]
+    fn normalize_requires_nonempty_key_for_cloanto() {
+        let mut data = CLOANTO_MAGIC.to_vec();
+        data.extend_from_slice(&[0u8; 16]);
+        assert_eq!(
+            Loader::normalize(&data, Some(&[])),
+            Err(LoaderError::InvalidKey)
+        );
+    }
+
+    #[test]
+    fn split_hi_lo_and_merge_hi_lo_round_trip() {
+        let canonical = synthetic_canonical_image();
+        let (hi, lo) = split_hi_lo(&canonical).unwrap();
+        let merged = merge_hi_lo(&hi, &lo).unwrap();
+        assert_eq!(merged, canonical);
+    }
+
+    #[test]
+    fn split_hi_lo_rejects_non_multiple_of_four() {
+        let data = vec![0u8; 6];
+        assert_eq!(split_hi_lo(&data), Err(LoaderError::UnalignedLength));
+    }
+
+    #[test]
+    fn merge_hi_lo_rejects_odd_length() {
+        let hi = vec![0u8; 3];
+        let lo = vec![0u8; 3];
+        assert_eq!(merge_hi_lo(&hi, &lo), Err(LoaderError::OddHiLoLength));
+    }
+
+    /// Hand-written 8-byte example (two canonical longwords) verifying
+    /// the interleave is positional: `b0 b1` of each longword goes to
+    /// hi, `b2 b3` goes to lo — not a byte-split, not word-swapped.
+    #[test]
+    fn split_hi_lo_interleaves_positionally() {
+        let rom: [u8; 8] = [0x11, 0x14, 0x4E, 0xF9, 0x00, 0xF8, 0x00, 0xD2];
+        let (hi, lo) = split_hi_lo(&rom).unwrap();
+        assert_eq!(hi, vec![0x11, 0x14, 0x00, 0xF8]);
+        assert_eq!(lo, vec![0x4E, 0xF9, 0x00, 0xD2]);
     }
 
     #[test]
@@ -722,5 +1168,247 @@ mod tests {
         assert_eq!(u16::from_be_bytes([img[0x0E], img[0x0F]]), 68);
         assert_eq!(u16::from_be_bytes([img[0x10], img[0x11]]), 37);
         assert_eq!(u16::from_be_bytes([img[0x12], img[0x13]]), 175);
+    }
+
+    // --- Milestone 2: every check true on synthetic fixtures ---------
+
+    fn all_checks_pass(rom: &KickRom) {
+        assert!(rom.check_size(), "check_size");
+        assert!(rom.check_header(), "check_header");
+        assert!(rom.check_footer(), "check_footer");
+        assert!(rom.check_size_field(), "check_size_field");
+        assert!(rom.verify_check_sum(), "verify_check_sum");
+        assert!(rom.check_magic_reset(), "check_magic_reset");
+        assert!(rom.is_kick_rom(), "is_kick_rom");
+    }
+
+    #[test]
+    fn synthetic_rom_passes_every_check_at_both_sizes() {
+        let img_256 = synthetic_rom(RomFixtureParams::new_256k());
+        let img_512 = synthetic_rom(RomFixtureParams::new_512k());
+        all_checks_pass(&KickRom::new(&img_256));
+        all_checks_pass(&KickRom::new(&img_512));
+    }
+
+    #[test]
+    fn value_reads_match_fixture_params_at_both_sizes() {
+        let mut params = RomFixtureParams::new_512k();
+        params.rom_rev = (40, 68);
+        params.exec_rev = (37, 175);
+        let img = synthetic_rom(params);
+        let rom = KickRom::new(&img);
+
+        assert_eq!(
+            rom.read_check_sum(),
+            Some(u32::from_be_bytes([
+                img[img.len() - 24],
+                img[img.len() - 23],
+                img[img.len() - 22],
+                img[img.len() - 21],
+            ]))
+        );
+        assert_eq!(rom.boot_pc(), Some(DEFAULT_BASE_512K + 0xD2));
+        assert_eq!(rom.base_addr(), Some(DEFAULT_BASE_512K));
+        assert_eq!(rom.rom_rev(), Some((40, 68)));
+        assert_eq!(rom.exec_rev(), Some((37, 175)));
+    }
+
+    // --- Hostile inputs: no panics, checks false, values None --------
+
+    fn assert_hostile_input_is_safe(data: &[u8]) {
+        let rom = KickRom::new(data);
+        assert!(!rom.check_header());
+        assert!(!rom.check_footer());
+        assert!(!rom.check_size_field());
+        assert!(!rom.verify_check_sum());
+        assert!(!rom.check_kickety_split());
+        assert!(!rom.check_magic_reset());
+        assert!(!rom.is_kick_rom());
+        let _ = rom.read_check_sum();
+        let _ = rom.base_addr();
+        let _ = rom.boot_pc();
+        let _ = rom.rom_rev();
+        let _ = rom.exec_rev();
+        let _ = rom.info();
+    }
+
+    #[test]
+    fn hostile_inputs_never_panic_and_report_false_or_none() {
+        assert_hostile_input_is_safe(&[]);
+        assert_hostile_input_is_safe(&[0u8]);
+        assert_hostile_input_is_safe(&[0u8; 23]);
+        assert_hostile_input_is_safe(&[0u8; 0x17]); // just under header size
+        assert_hostile_input_is_safe(&[0u8; 31]); // odd relative to footer, still short
+        assert_hostile_input_is_safe(&[0u8; 0x19]); // odd length
+        assert_hostile_input_is_safe(&vec![0u8; ROM_SIZE_256K - 1]); // truncated mid-footer/odd
+        assert_hostile_input_is_safe(&[0u8; 0x18]); // exactly header size, no footer
+    }
+
+    #[test]
+    fn value_reads_are_none_below_header_length_and_some_at_it() {
+        let short = vec![0u8; 0x17];
+        let rom = KickRom::new(&short);
+        assert_eq!(rom.boot_pc(), None);
+        assert_eq!(rom.base_addr(), None);
+        assert_eq!(rom.rom_rev(), None);
+        assert_eq!(rom.exec_rev(), None);
+
+        let exact = vec![0u8; 0x18];
+        let rom = KickRom::new(&exact);
+        assert_eq!(rom.boot_pc(), Some(0));
+        assert_eq!(rom.base_addr(), Some(0));
+        assert_eq!(rom.rom_rev(), Some((0, 0)));
+        assert_eq!(rom.exec_rev(), Some((0, 0)));
+    }
+
+    #[test]
+    fn read_check_sum_is_none_below_24_bytes_and_some_at_it() {
+        let short = vec![0u8; 23];
+        assert_eq!(KickRom::new(&short).read_check_sum(), None);
+        let exact = vec![0u8; 24];
+        assert_eq!(KickRom::new(&exact).read_check_sum(), Some(0));
+    }
+
+    // --- Corrupting exactly one field flips exactly its check ---------
+
+    #[test]
+    fn corrupting_header_marker_flips_only_header_check() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        img[0x00] = 0xAB;
+        img[0x01] = 0xCD;
+        seal_checksum(&mut img).unwrap(); // re-seal so only header is broken
+        let rom = KickRom::new(&img);
+        assert!(!rom.check_header());
+        assert!(rom.check_footer());
+        assert!(rom.check_size_field());
+        assert!(rom.verify_check_sum());
+        assert!(!rom.is_kick_rom());
+    }
+
+    #[test]
+    fn corrupting_footer_word_flips_only_footer_check() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        let len = img.len();
+        // Last word (len-2..len), one of the seven checked words.
+        img[len - 2] = 0xFF;
+        img[len - 1] = 0xFF;
+        seal_checksum(&mut img).unwrap();
+        let rom = KickRom::new(&img);
+        assert!(rom.check_header());
+        assert!(!rom.check_footer());
+        assert!(rom.check_size_field());
+        assert!(rom.verify_check_sum());
+        assert!(!rom.is_kick_rom());
+    }
+
+    #[test]
+    fn corrupting_len_minus_16_word_does_not_flip_footer_check() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        let len = img.len();
+        img[len - 16] = 0xFF;
+        img[len - 15] = 0xC0;
+        seal_checksum(&mut img).unwrap();
+        let rom = KickRom::new(&img);
+        assert!(rom.check_footer());
+        assert!(rom.is_kick_rom());
+    }
+
+    #[test]
+    fn corrupting_size_field_flips_only_size_field_check() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        let len = img.len();
+        let off = len - 20;
+        img[off..off + 4].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        seal_checksum(&mut img).unwrap();
+        let rom = KickRom::new(&img);
+        assert!(rom.check_header());
+        assert!(rom.check_footer());
+        assert!(!rom.check_size_field());
+        assert!(rom.verify_check_sum());
+        assert!(!rom.is_kick_rom());
+    }
+
+    #[test]
+    fn corrupting_any_content_byte_flips_checksum() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        // Flip a byte in the zero filler between header and footer,
+        // without re-sealing: only the checksum should go bad.
+        img[0x100] ^= 0xFF;
+        let rom = KickRom::new(&img);
+        assert!(rom.check_header());
+        assert!(rom.check_footer());
+        assert!(rom.check_size_field());
+        assert!(!rom.verify_check_sum());
+        assert!(!rom.is_kick_rom());
+    }
+
+    #[test]
+    fn header_marker_0x1111_fails_at_512_kib() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        img[0x00] = 0x11;
+        img[0x01] = 0x11;
+        seal_checksum(&mut img).unwrap();
+        assert!(!KickRom::new(&img).check_header());
+    }
+
+    // --- Kickety split ------------------------------------------------
+
+    #[test]
+    fn kickety_split_detected_with_0x1111_at_midpoint() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        let mid = img.len() / 2;
+        img[mid] = 0x11;
+        img[mid + 1] = 0x11;
+        img[mid + 2] = 0x4E;
+        img[mid + 3] = 0xF9;
+        assert!(KickRom::new(&img).check_kickety_split());
+    }
+
+    #[test]
+    fn kickety_split_not_detected_with_0x1114_at_midpoint() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        let mid = img.len() / 2;
+        img[mid] = 0x11;
+        img[mid + 1] = 0x14;
+        img[mid + 2] = 0x4E;
+        img[mid + 3] = 0xF9;
+        assert!(!KickRom::new(&img).check_kickety_split());
+    }
+
+    // --- Magic reset ----------------------------------------------------
+
+    #[test]
+    fn magic_reset_flips_when_0xd0_is_cleared() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        assert!(KickRom::new(&img).check_magic_reset());
+        img[0xD0] = 0;
+        img[0xD1] = 0;
+        seal_checksum(&mut img).unwrap();
+        assert!(!KickRom::new(&img).check_magic_reset());
+        // Not part of is_kick.
+        assert!(KickRom::new(&img).is_kick_rom());
+    }
+
+    // --- seal_checksum --------------------------------------------------
+
+    #[test]
+    fn seal_checksum_restores_verify_check_sum_after_mutation() {
+        let mut img = synthetic_rom(RomFixtureParams::new_512k());
+        img[0x200] ^= 0xFF;
+        assert!(!KickRom::new(&img).verify_check_sum());
+        seal_checksum(&mut img).unwrap();
+        assert!(KickRom::new(&img).verify_check_sum());
+    }
+
+    #[test]
+    fn seal_checksum_rejects_too_short_and_unaligned() {
+        let mut too_short = vec![0u8; 23];
+        assert_eq!(seal_checksum(&mut too_short), Err(SealError::TooShort));
+
+        let mut unaligned = vec![0u8; 25];
+        assert_eq!(
+            seal_checksum(&mut unaligned),
+            Err(SealError::NotLongwordAligned)
+        );
     }
 }
