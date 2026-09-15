@@ -75,8 +75,9 @@ struct Summary {
 
 #[test]
 fn real_roms_are_internally_consistent() {
-    let Some(dir) = rom_dir() else {
-        return;
+    let dir = match rom_dir() {
+        Some(dir) => dir,
+        None => return,
     };
     let files = rom_files(&dir);
     let key = std::env::var("AMIGA_ROM_KEY").ok();
@@ -112,9 +113,12 @@ fn real_roms_are_internally_consistent() {
         let canonical: Vec<u8> = match encoding {
             Some(RomEncoding::Raw(amiga_rom::ByteOrder::Normal)) => data,
             Some(RomEncoding::CloantoEncoded) => {
-                let Some(key_str) = key.as_deref() else {
-                    summary.skipped += 1;
-                    continue;
+                let key_str = match key.as_deref() {
+                    Some(k) => k,
+                    None => {
+                        summary.skipped += 1;
+                        continue;
+                    }
                 };
                 match Loader::normalize(&data, Some(key_str.as_bytes())) {
                     Ok(bytes) => bytes,
