@@ -492,6 +492,31 @@ impl<'a> KickRom<'a> {
         checksum_ones_complement(self.data) == 0xFFFF_FFFF
     }
 
+    /// `true` iff the image is exactly [`ROM_SIZE_512K`] and its first
+    /// and second 256 KiB halves are byte-for-byte identical — real
+    /// Kickstart 1.3 dumps commonly show up padded this way (the 256 KiB
+    /// image literally concatenated with itself). Verified against a
+    /// real such fixture, not assumed; see `PLAN.md`'s milestone-2
+    /// addendum.
+    ///
+    /// This is a stronger, **separate** fact from
+    /// [`KickRom::check_kickety_split`], which only checks 4 bytes at
+    /// the midpoint: a doubled image satisfies `check_kickety_split`
+    /// too (the duplicate header is genuinely there), but the reverse
+    /// doesn't hold — a native 512 KiB build can satisfy
+    /// `check_kickety_split` by coincidence without its halves being
+    /// duplicates. Informational only, like `check_kickety_split` and
+    /// [`KickRom::check_magic_reset`] — not part of
+    /// [`KickRom::is_kick_rom`]'s conjunction.
+    pub fn check_doubled(&self) -> bool {
+        let len = self.data.len();
+        if len != ROM_SIZE_512K {
+            return false;
+        }
+        let half = len / 2;
+        self.data[..half] == self.data[half..]
+    }
+
     /// `true` iff the "kickety split" signature — a second copy of the
     /// marker word + `JMP` opcode at the image's exact midpoint
     /// (`docs/research/header-footer-facts.md` §4) — is present.
@@ -637,7 +662,8 @@ impl<'a> KickRom<'a> {
     }
 
     /// Aggregates every check/value into one [`RomInfo`], matching
-    /// `romtool info`'s field set.
+    /// `romtool info`'s field set plus [`RomInfo::doubled_ok`], a fact
+    /// `romtool info` doesn't report (see [`KickRom::check_doubled`]).
     pub fn info(&self) -> RomInfo {
         RomInfo {
             size_ok: self.check_size(),
@@ -646,6 +672,7 @@ impl<'a> KickRom<'a> {
             size_field_ok: self.check_size_field(),
             chk_sum_ok: self.verify_check_sum(),
             kickety_split_ok: self.check_kickety_split(),
+            doubled_ok: self.check_doubled(),
             magic_reset_ok: self.check_magic_reset(),
             is_kick: self.is_kick_rom(),
             check_sum: self.read_check_sum(),
@@ -711,7 +738,8 @@ pub fn seal_checksum(rom: &mut [u8]) -> Result<(), SealError> {
 }
 
 /// The aggregate result of every [`KickRom`] check, matching `romtool
-/// info`'s field set. Value fields are `None` exactly when the image is
+/// info`'s field set (plus [`RomInfo::doubled_ok`], which `romtool`
+/// doesn't report). Value fields are `None` exactly when the image is
 /// too short to contain that field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RomInfo {
@@ -721,6 +749,10 @@ pub struct RomInfo {
     pub size_field_ok: bool,
     pub chk_sum_ok: bool,
     pub kickety_split_ok: bool,
+    /// `true` iff [`KickRom::check_doubled`] — the image's two 256 KiB
+    /// halves are byte-for-byte identical. Not a `romtool info` field;
+    /// see that method's doc comment.
+    pub doubled_ok: bool,
     pub magic_reset_ok: bool,
     pub is_kick: bool,
     pub check_sum: Option<u32>,
@@ -2047,6 +2079,54 @@ mod tests {
         img[mid + 2] = 0x4E;
         img[mid + 3] = 0xF9;
         assert!(!KickRom::new(&img).check_kickety_split());
+    }
+
+    // --- Doubled ----------------------------------------------------------
+
+    #[test]
+    fn doubled_detected_when_halves_are_byte_for_byte_identical() {
+        let half = synthetic_rom(RomFixtureParams::new_256k());
+        let mut img = half.clone();
+        img.extend_from_slice(&half);
+        assert_eq!(img.len(), ROM_SIZE_512K);
+        assert!(KickRom::new(&img).check_doubled());
+    }
+
+    #[test]
+    fn doubled_not_detected_for_a_native_512k_image() {
+        // A genuine 512 KiB fixture's two halves are not duplicates of
+        // each other (different header/footer content on each side).
+        let img = synthetic_rom(RomFixtureParams::new_512k());
+        assert!(!KickRom::new(&img).check_doubled());
+    }
+
+    #[test]
+    fn doubled_false_for_wrong_size_images() {
+        assert!(!KickRom::new(&synthetic_rom(RomFixtureParams::new_256k())).check_doubled());
+        assert!(!KickRom::new(&[]).check_doubled());
+        assert!(!KickRom::new(&[0u8; 10]).check_doubled());
+    }
+
+    #[test]
+    fn doubled_one_byte_difference_is_not_doubled() {
+        let half = synthetic_rom(RomFixtureParams::new_256k());
+        let mut img = half.clone();
+        img.extend_from_slice(&half);
+        // Flip one byte deep in the second half only.
+        let last = img.len() - 1;
+        img[last] ^= 0xFF;
+        assert!(!KickRom::new(&img).check_doubled());
+    }
+
+    #[test]
+    fn info_reports_doubled_ok() {
+        let half = synthetic_rom(RomFixtureParams::new_256k());
+        let mut img = half.clone();
+        img.extend_from_slice(&half);
+        assert!(KickRom::new(&img).info().doubled_ok);
+
+        let native = synthetic_rom(RomFixtureParams::new_512k());
+        assert!(!KickRom::new(&native).info().doubled_ok);
     }
 
     // --- Magic reset ----------------------------------------------------

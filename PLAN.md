@@ -328,6 +328,34 @@ Ordered so each item's tests exist before or with it.
       "ours-is-stricter" rather than expecting equality on corrupt
       images; `is_kick` itself still agrees, which is the check that
       matters.
+- [x] **`check_doubled`** — implemented: `KickRom::check_doubled`,
+      `RomInfo::doubled_ok`, wired into `info()`. Informational only,
+      not part of `is_kick_rom`. 5 new tests (both-halves-identical,
+      native-512K-not-doubled, wrong sizes, one-byte-difference,
+      `info()` wiring). No differential-harness change needed —
+      `doubled_ok` has no `romtool` line to compare against, and the
+      harness already compares field-by-field rather than
+      exhaustively, so it simply never references the new field. A
+      gap found post-0.3.0: real Kickstart 1.3
+      dumps commonly show up padded to 512 KiB by literally
+      concatenating the 256 KiB image with itself (not the same thing
+      as `kickety_split`, which only checks 4 bytes — the marker word
+      + JMP opcode — at the midpoint; a doubled image trips
+      `kickety_split` too, since the duplicate header is real, but a
+      512 KiB image can satisfy `kickety_split` without being doubled
+      — they're separate facts). **Confirmed locally**: this repo's
+      own `KICK13.ROM` fixture
+      (`~/src/external/Copperline/test-assets/KICK13.ROM`, 512 KiB) has
+      its first and second 256 KiB halves byte-for-byte identical —
+      verified directly, not assumed. Add `KickRom::check_doubled(&self)
+      -> bool` (`data.len() == ROM_SIZE_512K && data[..256Ki] ==
+      data[256Ki..]`) and a `doubled_ok` field on `RomInfo`, naming
+      matched to this crate's existing `_ok` convention
+      (`kickety_split_ok`, `magic_reset_ok`) rather than any external
+      reference's field name. Informational only, like
+      `kickety_split_ok`/`magic_reset_ok` — not part of `is_kick_rom`'s
+      conjunction, same reasoning: whether a ROM happens to be padded
+      by duplication says nothing about its own validity.
 - [x] **`RomInfo` + differential oracle.** `info()` aggregate;
       env-gated `AMIGA_ROM_DIFFERENTIAL=1` test comparing field-for-
       field against pinned amitools `romtool info` over the synthetic
