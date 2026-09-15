@@ -365,7 +365,7 @@ Ordered so each item's tests exist before or with it.
       synthetic fixtures. (Until the last `todo!()` in a fuzzed path
       is gone, the target simply can't be written — which is itself
       the argument for finishing milestone 2 before growing API.)
-- [ ] **Publish 0.2.0** once `info` parity holds: the crate is
+- [x] **Publish 0.2.0** once `info` parity holds: the crate is
       already useful (emulators and dump tools want exactly
       normalize+identify), and publishing early is the sibling
       crates' pattern.
@@ -602,9 +602,9 @@ anchor before reaching for heuristics.
 - [x] **Real-ROM harness**: the `AMIGA_ROM_DIR` env-gated test
       module (skips silently when unset), asserting known facts
       about known ROMs by KickSum. Local-only, never CI.
-- [ ] **crates.io**: reserve/publish `amiga-rom` 0.2.0 at end of
-      milestone 2 (see item there); 0.x thereafter until the
-      milestone-4 interfaces prove out.
+- [x] **crates.io**: published `amiga-rom` 0.2.0 (2026-09-15, tag
+      `v0.2.0`); 0.x thereafter until the milestone-4 interfaces prove
+      out.
 
 ## Non-goals, so they don't creep in
 
