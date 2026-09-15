@@ -21,14 +21,27 @@ Zero dependencies. MSRV 1.63. Licensed under MIT OR Apache-2.0.
 
 ## Status
 
-Milestone 2 (`info` parity) is complete: normalizing a raw ROM dump
-(byte-order detection/reordering, Cloanto decode, hi/lo split/merge) and
-inspecting/validating a canonical image are both fully implemented,
-bounds-checked against arbitrary input, and verified — against a
-differential harness comparing field-for-field with `romtool`, a sweep of
-real ROM dumps, and 20M+ fuzz executions with zero crashes. See
-[PLAN.md](PLAN.md) for what's next: resident scanning (`scan`), then the
-pluggable split/build catalog.
+Milestones 1–5 are complete:
+
+- **Normalize + inspect** (`Loader`, `KickRom::info`) — byte-order
+  detection/reordering, Cloanto decode, hi/lo split/merge, every header/
+  footer/checksum check, all bounds-checked against arbitrary input.
+- **Scan** (`KickRom::scan`) — an allocation-free iterator over the
+  ROM's `Resident` (RomTag) structures, matching `romtool scan` exactly
+  against real ROMs.
+- **Split** (`split`) — bounds-checked extraction of caller-supplied
+  module byte ranges into borrowed slices.
+- **Combine + patch** (`combine`, `apply_patches`) — concatenate two
+  512 KiB images (with a documented, tested fix for `romtool combine`'s
+  surprising reversed argument order), and a two-pass verify-then-apply
+  binary patch primitive that never leaves a buffer half-patched.
+
+Verified throughout via a differential harness against `romtool`, a
+sweep of real ROM dumps, and 40M+ fuzz executions with zero crashes.
+See [PLAN.md](PLAN.md) for what's next: independently deriving
+module-boundary data without the restricted Remus/Romsplit catalog
+(milestone 6, deliberately last — a research problem, not a quick
+implementation).
 
 ## Example
 
