@@ -25,7 +25,9 @@ Milestones 1–5 are complete:
 
 - **Normalize + inspect** (`Loader`, `KickRom::info`) — byte-order
   detection/reordering, Cloanto decode, hi/lo split/merge, every header/
-  footer/checksum check, all bounds-checked against arbitrary input.
+  footer/checksum check (including `check_doubled`, for the common real
+  Kickstart 1.3 padding-by-duplication layout), all bounds-checked
+  against arbitrary input.
 - **Scan** (`KickRom::scan`) — an allocation-free iterator over the
   ROM's `Resident` (RomTag) structures, matching `romtool scan` exactly
   against real ROMs.
