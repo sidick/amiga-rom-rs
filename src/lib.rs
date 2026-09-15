@@ -379,6 +379,21 @@ pub fn checksum_ones_complement(data: &[u8]) -> u32 {
     sum
 }
 
+/// Finds `needle` as a literal contiguous substring of `haystack`,
+/// returning the matching (borrowed) slice — used by
+/// [`KickRom::machine_hints`] to look for AROS's `"amiga-m68k"` port
+/// token in a resident's `id_string`. `None` if `needle` is empty or
+/// not found.
+fn find_subslice<'a>(haystack: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| &haystack[i..i + needle.len()])
+}
+
 /// A canonical Kickstart ROM image, borrowed for inspection.
 ///
 /// Allocation-free: every method reads directly from the borrowed
@@ -669,11 +684,14 @@ impl<'a> KickRom<'a> {
     ///
     /// **This is a heuristic, not a fact**, unlike every other method
     /// on this type: it is incomplete by construction. Plenty of real
-    /// ROMs (pre-3.0-era dumps outside the one sampled, CD32, CDTV,
-    /// AROS) carry none of these markers, and this method correctly
-    /// returns all-`None`/`false` on such an image rather than a wrong
-    /// guess — an empty [`MachineHints`] means "no signal found", not
-    /// "not a Kickstart ROM".
+    /// ROMs (pre-3.0-era dumps outside the ones sampled, CD32, CDTV)
+    /// carry none of these markers, and this method correctly returns
+    /// all-`None`/`false` on such an image rather than a wrong guess —
+    /// an empty [`MachineHints`] means "no signal found", not "not a
+    /// Kickstart ROM". Confirmed on a real AROS ROM that a heuristic's
+    /// signals can also be actively *wrong*, not just absent — see
+    /// [`MachineHints::is_aros`]'s doc comment for the false positive
+    /// found and fixed.
     ///
     /// Confirmed empirically against five real Kickstart 3.1 ROMs
     /// (A600/A1200/A3000/A4000/A4000T): Commodore embeds a resident
@@ -686,6 +704,8 @@ impl<'a> KickRom<'a> {
         let mut named_machine = None;
         let mut has_pcmcia = false;
         let mut has_ncr_scsi = false;
+        let mut is_aros = false;
+        let mut target_platform = None;
         for resident in self.scan() {
             if let Some(name) = resident.name.strip_suffix(b" bonus") {
                 named_machine = Some(name);
@@ -696,11 +716,25 @@ impl<'a> KickRom<'a> {
             if resident.name == b"NCR scsi.device" {
                 has_ncr_scsi = true;
             }
+            if resident.name == b"aros.library" {
+                is_aros = true;
+            }
+            if target_platform.is_none() {
+                target_platform = find_subslice(resident.id_string, b"amiga-m68k");
+            }
+        }
+        if is_aros {
+            // Confirmed on a real AROS ROM: card.resource ships
+            // generically there, not as a genuine PCMCIA-hardware
+            // signal — see MachineHints::is_aros's doc comment.
+            has_pcmcia = false;
         }
         MachineHints {
             named_machine,
             has_pcmcia,
             has_ncr_scsi,
+            is_aros,
+            target_platform,
         }
     }
 
@@ -796,6 +830,32 @@ pub struct MachineHints<'a> {
     /// `true` iff an `NCR scsi.device` resident was found — seen on
     /// A4000T, alongside the `scsi.device` every machine has.
     pub has_ncr_scsi: bool,
+    /// `true` iff an `aros.library` resident was found — a reliable,
+    /// AROS-specific token (unlike `card.resource`, essentially no
+    /// genuine Commodore/Hyperion Kickstart carries it).
+    ///
+    /// When `true`, [`MachineHints::has_pcmcia`] is forced `false`
+    /// even if a `card.resource`/`carddisk.device` resident is
+    /// present: confirmed on a real AROS ROM
+    /// (`aros-20181209.rom`) that AROS ships `card.resource`
+    /// generically for broad hardware compatibility, not because
+    /// that build targets real A600/A1200 PCMCIA hardware — treating
+    /// it as a PCMCIA signal there was a real false positive found
+    /// and fixed, not a hypothetical one.
+    pub is_aros: bool,
+    /// The AROS `<platform>-<cpu>` port token (e.g. `b"amiga-m68k"`),
+    /// found as a literal substring in a resident's `id_string`, if
+    /// any. Confirmed against AROS's own documentation
+    /// (<https://aros.sourceforge.io/introduction/ports.html>):
+    /// "AROS/amiga-m68k is the native port for m68k Amigas, or
+    /// emulators like WinUAE."
+    ///
+    /// Deliberately checks only for this one confirmed literal token,
+    /// not a general `<platform>-<cpu>` parser — other AROS ports use
+    /// different tokens this crate doesn't recognize yet; extend when
+    /// a real sample justifies it, same discipline as everywhere else
+    /// in this crate.
+    pub target_platform: Option<&'a [u8]>,
 }
 
 /// One entry in a checksum-keyed known-ROM lookup table, for
@@ -2933,6 +2993,63 @@ mod scan_tests {
         assert!(hints.named_machine.is_none());
         assert!(!hints.has_pcmcia);
         assert!(!hints.has_ncr_scsi);
+        assert!(!hints.is_aros);
+        assert!(hints.target_platform.is_none());
+    }
+
+    #[test]
+    fn machine_hints_reads_target_platform_from_id_string() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        write_cstr(&mut img, 0x500, b"exec.library");
+        write_cstr(&mut img, 0x520, b"exec.library amiga-m68k 51.3 (9.12.2018)");
+        write_resident(
+            &mut img,
+            0x300,
+            base,
+            0,
+            51,
+            9,
+            0,
+            base + 0x500,
+            base + 0x520,
+            0,
+            0,
+        );
+
+        let hints = KickRom::new(&img).machine_hints();
+        assert_eq!(hints.target_platform, Some(&b"amiga-m68k"[..]));
+    }
+
+    #[test]
+    fn machine_hints_is_aros_forces_has_pcmcia_false_despite_card_resource() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        write_cstr(&mut img, 0x500, b"aros.library");
+        write_cstr(&mut img, 0x520, b"card.resource");
+        write_resident(&mut img, 0x300, base, 0, 41, 9, 0, base + 0x500, 0, 0, 0);
+        write_resident(&mut img, 0x340, base, 0, 41, 8, 0, base + 0x520, 0, 0, 0);
+
+        let hints = KickRom::new(&img).machine_hints();
+        assert!(hints.is_aros);
+        assert!(
+            !hints.has_pcmcia,
+            "AROS ships card.resource generically; must not read as a PCMCIA signal"
+        );
+    }
+
+    #[test]
+    fn machine_hints_non_aros_card_resource_still_signals_pcmcia() {
+        // Sanity check the fix doesn't overreach: card.resource without
+        // an aros.library resident still means has_pcmcia.
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        write_cstr(&mut img, 0x500, b"card.resource");
+        write_resident(&mut img, 0x300, base, 0, 1, 8, 0, base + 0x500, 0, 0, 0);
+
+        let hints = KickRom::new(&img).machine_hints();
+        assert!(!hints.is_aros);
+        assert!(hints.has_pcmcia);
     }
 }
 

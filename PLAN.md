@@ -482,20 +482,7 @@ milestone 2.)
       `ResidentScan`, which all exist by now; no new API unless the
       CLI proves something missing (in which case it gets added here
       first).
-- [x] **Machine identification** — implemented per the design below,
-      and re-verified against all 7 real ROM files this session
-      touched (not just the synthetic fixtures the unit tests use):
-      every `identify(read_check_sum(), KNOWN_ROMS)` lookup matched
-      the expected machine exactly, and `machine_hints` behaved
-      exactly as documented on the A4000T case specifically — it
-      correctly reports `named_machine: Some("A4000")` (the `bonus`
-      resident doesn't distinguish the tower variant) with
-      `has_ncr_scsi: true` as the actual differentiator, not a
-      fabricated `"A4000T"`. 12 new tests (3 `machine_hints`, 4
-      `identify`, plus the doubled-checksum table invariant). Added to
-      the fuzz target (`machine_hints`, no new panic surface since it
-      only iterates the already-fuzzed `scan()`, but included per this
-      project's own convention of fuzzing every new entry point). — new item, raised post-0.3.0 (not
+- [x] **Machine identification** — new item, raised post-0.3.0 (not
       in `romtool` at all; this crate's own addition, grilled
       2026-09-15). Two complementary pieces, both decided:
 
@@ -565,6 +552,50 @@ milestone 2.)
       commitment this crate hasn't signed up for); a caller with more
       entries passes their own `&[KnownRom]` to the same `identify`
       function.
+
+      **Implemented and re-verified against all 7 real ROM files this
+      session touched** (not just the synthetic fixtures the unit
+      tests use): every `identify(read_check_sum(), KNOWN_ROMS)`
+      lookup matched the expected machine exactly, and
+      `machine_hints` behaved exactly as documented on the A4000T
+      case — `named_machine: Some("A4000")` (the `bonus` resident
+      doesn't distinguish the tower variant), `has_ncr_scsi: true`
+      carrying the actual differentiator, not a fabricated
+      `"A4000T"`. 12 tests; added to the fuzz target.
+
+      **A real false positive found immediately after, on AROS**
+      (`aros-20181209.rom`, real local file): `machine_hints` reported
+      `has_pcmcia: true` — wrong. AROS's ROM ships a `card.resource`
+      resident generically (for broad hardware compatibility), not
+      because this build targets real A600/A1200 PCMCIA hardware.
+      Investigated and fixed rather than left as a known limitation:
+
+      - **`aros.library`** is a reliable, AROS-specific resident name
+        (unlike `card.resource`, essentially no genuine Commodore/
+        Hyperion Kickstart would carry it) — added `is_aros: bool`.
+      - Several residents' `id_string`s (`exec.library`,
+        `expansion.library`, `timer.device`, `battclock.resource`,
+        `kernel.resource`, `processor.resource`) carry the literal
+        token `"amiga-m68k"` — AROS's own documented `<platform>-<cpu>`
+        port-naming convention (confirmed against
+        https://aros.sourceforge.io/introduction/ports.html, quoted:
+        "AROS/amiga-m68k is the native port for m68k Amigas, or
+        emulators like WinUAE... most complete port of AROS"). Added
+        `target_platform: Option<&[u8]>`, a borrowed substring match
+        against that one confirmed literal token — deliberately not a
+        general `<platform>-<cpu>` parser (only one token is confirmed
+        against a real sample; other AROS ports use different tokens
+        this crate doesn't specifically recognize yet, extend when a
+        real sample justifies it, same discipline as everywhere else
+        in this crate).
+      - **Fix**: `has_pcmcia` is forced `false` when `is_aros` is
+        true — documented as a deliberate carve-out, not silently
+        dropped. The `uaegfx.hidd`/`ata_gayle.hidd` residents also
+        present on this ROM corroborate the reading: this build
+        targets m68k Amiga-class systems broadly (real Gayle-equipped
+        hardware *or* UAE-family emulators), not one Commodore model,
+        which is exactly why it carries generic hardware-support
+        residents instead of one machine's subset.
 
 ## Milestone 4 — split (modules), scoped down
 
