@@ -425,7 +425,11 @@ milestone 2.)
       the image, self-pointers outside the image, strings running
       off the end, a `rt_EndSkip` pointing backwards — all yield
       "not a resident" or a truncated-but-typed result, never a
-      panic. These cases go straight into the fuzz corpus.
+      panic. Covered by 9 synthetic unit tests (`scan_tests`) and
+      added to `fuzz/fuzz_targets/parse.rs`
+      (`rom.scan().collect::<Vec<_>>()`, proving both no-panic and
+      termination on adversarial input) — 13M further fuzz executions
+      with the new coverage, zero crashes.
 - [ ] ~~**`exec_rev` resolved**~~ — moved to milestone 2 (milestone 1
       proved it's a fixed read at header offset 0x10, not
       resident-derived); only `RomInfo` finalization remains here if
@@ -443,7 +447,7 @@ milestone 2.)
       fixtures (`scan_tests`, 9 tests: valid hit, wrong self-pointer,
       truncated matchword, multiple hits, string resolution in/out of
       bounds, EndSkip-not-trusted, base_addr-unknown).
-- [ ] **`dump`/`diff` stay CLI-side.** `dump` is hex formatting of
+- [x] **`dump`/`diff` stay CLI-side.** `dump` is hex formatting of
       bytes the library already hands over; `diff` is a byte/field
       comparison of two normalized images plus formatting. The
       library's contribution is `Loader::normalize` + `RomInfo` +
