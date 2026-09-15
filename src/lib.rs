@@ -661,6 +661,49 @@ impl<'a> KickRom<'a> {
         }
     }
 
+    /// Best-effort machine-identity signals read from this image's
+    /// `Resident` structures (`PLAN.md`'s "Machine identification"
+    /// item). Built entirely on [`KickRom::scan`] — no new low-level
+    /// parsing, no restricted data (these are plaintext module names
+    /// Commodore put in the ROM, visible to anyone who scans it).
+    ///
+    /// **This is a heuristic, not a fact**, unlike every other method
+    /// on this type: it is incomplete by construction. Plenty of real
+    /// ROMs (pre-3.0-era dumps outside the one sampled, CD32, CDTV,
+    /// AROS) carry none of these markers, and this method correctly
+    /// returns all-`None`/`false` on such an image rather than a wrong
+    /// guess — an empty [`MachineHints`] means "no signal found", not
+    /// "not a Kickstart ROM".
+    ///
+    /// Confirmed empirically against five real Kickstart 3.1 ROMs
+    /// (A600/A1200/A3000/A4000/A4000T): Commodore embeds a resident
+    /// literally named `"<machine> bonus"` on at least the A3000/A4000
+    /// family (present as far back as 2.04 on the A3000 sampled, not
+    /// just 3.1); `card.resource`/`carddisk.device` (PCMCIA) appear
+    /// only on A600/A1200; `NCR scsi.device` appears only on A4000T,
+    /// alongside the `scsi.device` every machine has.
+    pub fn machine_hints(&self) -> MachineHints<'a> {
+        let mut named_machine = None;
+        let mut has_pcmcia = false;
+        let mut has_ncr_scsi = false;
+        for resident in self.scan() {
+            if let Some(name) = resident.name.strip_suffix(b" bonus") {
+                named_machine = Some(name);
+            }
+            if resident.name == b"card.resource" || resident.name == b"carddisk.device" {
+                has_pcmcia = true;
+            }
+            if resident.name == b"NCR scsi.device" {
+                has_ncr_scsi = true;
+            }
+        }
+        MachineHints {
+            named_machine,
+            has_pcmcia,
+            has_ncr_scsi,
+        }
+    }
+
     /// Aggregates every check/value into one [`RomInfo`], matching
     /// `romtool info`'s field set plus [`RomInfo::doubled_ok`], a fact
     /// `romtool info` doesn't report (see [`KickRom::check_doubled`]).
@@ -736,6 +779,412 @@ pub fn seal_checksum(rom: &mut [u8]) -> Result<(), SealError> {
     rom[checksum_off..checksum_off + 4].copy_from_slice(&(!sum).to_be_bytes());
     Ok(())
 }
+
+/// Best-effort machine-identity signals from [`KickRom::machine_hints`].
+/// See that method's doc comment — this is a heuristic, not a fact;
+/// an all-`None`/`false` value means "no signal found in this image's
+/// residents", not "not a Kickstart ROM".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineHints<'a> {
+    /// The machine name from a `"<machine> bonus"` resident (e.g.
+    /// `b"A3000"`, `b"A4000"`), with the `" bonus"` suffix stripped.
+    /// `None` if no such resident was found.
+    pub named_machine: Option<&'a [u8]>,
+    /// `true` iff a `card.resource` or `carddisk.device` resident was
+    /// found — PCMCIA support, seen on A600/A1200.
+    pub has_pcmcia: bool,
+    /// `true` iff an `NCR scsi.device` resident was found — seen on
+    /// A4000T, alongside the `scsi.device` every machine has.
+    pub has_ncr_scsi: bool,
+}
+
+/// One entry in a checksum-keyed known-ROM lookup table, for
+/// [`identify`]. `PLAN.md`'s "Machine identification" item: unlike
+/// [`KickRom::machine_hints`] (needs the actual ROM bytes), this
+/// identifies a ROM from its [`KickRom::read_check_sum`] value alone —
+/// useful when cataloging dumps you haven't loaded yet. `devices` is
+/// that ROM's resident name list, resolved once from a real scan;
+/// redundant with [`KickRom::scan`] when the bytes *are* in hand, but
+/// the point of this type when they aren't.
+///
+/// Plain data, no trait — matching milestone 4's `ModuleSpec`
+/// precedent: nothing here needs polymorphism, only a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownRom<'a> {
+    /// The stored KickSum checksum ([`KickRom::read_check_sum`]) that
+    /// identifies this ROM.
+    pub check_sum: u32,
+    /// The machine this ROM shipped on/for, e.g. `"A3000"`.
+    pub machine: &'a str,
+    /// (major, minor) ROM revision.
+    pub rom_rev: (u16, u16),
+    /// (major, minor) Exec revision.
+    pub exec_rev: (u16, u16),
+    /// This ROM's resident names, from an actual [`KickRom::scan`] run.
+    pub devices: &'a [&'a str],
+}
+
+/// Looks up `check_sum` in `table`, returning the first matching entry.
+///
+/// Mechanism only — this crate ships [`KNOWN_ROMS`], a small seed
+/// table (see its own doc comment), but any caller-supplied `table`
+/// works identically; there is nothing special about the shipped one
+/// beyond being a convenient default.
+pub fn identify<'a>(check_sum: u32, table: &[KnownRom<'a>]) -> Option<KnownRom<'a>> {
+    table.iter().find(|rom| rom.check_sum == check_sum).copied()
+}
+
+/// A small seed table of real Kickstart ROMs, each independently
+/// verified during this crate's development (stored checksum read
+/// directly, `rom_rev`/`exec_rev` cross-checked against
+/// [`KickRom::info`], `devices` from an actual [`KickRom::scan`] run —
+/// not copied from any external database). Checksum/version facts of
+/// this kind are publicly documented (e.g. Cloanto's "ROM Types
+/// Summary" page) — unlike the milestone-4 Remus/Romsplit situation,
+/// nothing restricted is involved.
+///
+/// Deliberately small and not an attempt at exhaustive coverage — that
+/// would be an open-ended maintenance commitment this crate hasn't
+/// signed up for. A caller with more entries passes their own
+/// `&[KnownRom]` to [`identify`]; this table is just a convenient,
+/// verified starting point.
+pub const KNOWN_ROMS: &[KnownRom<'static>] = &[
+    KnownRom {
+        check_sum: 0x150B_7DB3,
+        machine: "A3000",
+        rom_rev: (34, 5),
+        exec_rev: (34, 2),
+        devices: &[
+            "exec.library",
+            "alert.hook",
+            "audio.device",
+            "cia.resource",
+            "disk.resource",
+            "expansion.library",
+            "graphics.library",
+            "intuition.library",
+            "layers.library",
+            "mathffp.library",
+            "misc.resource",
+            "potgo.resource",
+            "ramlib.library",
+            "keymap.resource",
+            "keyboard.device",
+            "gameport.device",
+            "input.device",
+            "console.device",
+            "strap",
+            "timer.device",
+            "trackdisk.device",
+            "romboot.library",
+            "workbench.task",
+            "dos.library",
+        ],
+    },
+    KnownRom {
+        check_sum: 0x5487_6DAB,
+        machine: "A3000",
+        rom_rev: (37, 175),
+        exec_rev: (37, 132),
+        devices: &[
+            "exec.library",
+            "alert.hook",
+            "expansion.library",
+            "diag init",
+            "audio.device",
+            "battclock.resource",
+            "battmem.resource",
+            "A3000 bonus",
+            "bootmenu",
+            "syscheck",
+            "cia.resource",
+            "con-handler",
+            "console.device",
+            "disk.resource",
+            "dos.library",
+            "FileSystem.resource",
+            "filesystem",
+            "gadtools.library",
+            "icon.library",
+            "keymap.library",
+            "layers.library",
+            "mathffp.library",
+            "mathieeesingbas.library",
+            "misc.resource",
+            "potgo.resource",
+            "ram-handler",
+            "ramdrive.device",
+            "ramlib",
+            "gameport.device",
+            "keyboard.device",
+            "input.device",
+            "scsi.device",
+            "shell",
+            "romboot",
+            "strap",
+            "timer.device",
+            "trackdisk.device",
+            "utility.library",
+            "workbench.task",
+            "graphics.library",
+            "intuition.library",
+            "workbench.library",
+        ],
+    },
+    KnownRom {
+        check_sum: 0x87BA_7A3E,
+        machine: "A1200",
+        rom_rev: (40, 68),
+        exec_rev: (40, 10),
+        devices: &[
+            "exec.library",
+            "alert.hook",
+            "expansion.library",
+            "diag init",
+            "romboot",
+            "strap",
+            "graphics.library",
+            "dos.library",
+            "filesystem",
+            "console.device",
+            "layers.library",
+            "scsi.device",
+            "con-handler",
+            "gameport.device",
+            "keyboard.device",
+            "input.device",
+            "audio.device",
+            "card.resource",
+            "utility.library",
+            "battclock.resource",
+            "carddisk.device",
+            "ramlib",
+            "ramdrive.device",
+            "cia.resource",
+            "misc.resource",
+            "workbench.task",
+            "potgo.resource",
+            "FileSystem.resource",
+            "disk.resource",
+            "mathffp.library",
+            "timer.device",
+            "mathieeesingbas.library",
+            "keymap.library",
+            "bootmenu",
+            "syscheck",
+            "trackdisk.device",
+            "icon.library",
+            "ram-handler",
+            "shell",
+            "intuition.library",
+            "gadtools.library",
+            "workbench.library",
+            "battmem.resource",
+        ],
+    },
+    KnownRom {
+        check_sum: 0x8F4C_0C67,
+        machine: "A3000",
+        rom_rev: (40, 68),
+        exec_rev: (40, 10),
+        devices: &[
+            "exec.library",
+            "alert.hook",
+            "layers.library",
+            "keymap.library",
+            "mathffp.library",
+            "scsi.device",
+            "audio.device",
+            "battclock.resource",
+            "battmem.resource",
+            "gameport.device",
+            "keyboard.device",
+            "input.device",
+            "workbench.task",
+            "con-handler",
+            "console.device",
+            "misc.resource",
+            "dos.library",
+            "A3000 bonus",
+            "filesystem",
+            "graphics.library",
+            "icon.library",
+            "romboot",
+            "strap",
+            "utility.library",
+            "FileSystem.resource",
+            "mathieeesingbas.library",
+            "potgo.resource",
+            "ram-handler",
+            "disk.resource",
+            "ramlib",
+            "bootmenu",
+            "syscheck",
+            "shell",
+            "timer.device",
+            "expansion.library",
+            "diag init",
+            "trackdisk.device",
+            "ramdrive.device",
+            "intuition.library",
+            "gadtools.library",
+            "workbench.library",
+            "cia.resource",
+        ],
+    },
+    KnownRom {
+        check_sum: 0x45C3_145E,
+        machine: "A4000",
+        rom_rev: (40, 68),
+        exec_rev: (40, 10),
+        devices: &[
+            "exec.library",
+            "alert.hook",
+            "layers.library",
+            "cia.resource",
+            "audio.device",
+            "scsi.device",
+            "bootmenu",
+            "syscheck",
+            "timer.device",
+            "battmem.resource",
+            "gameport.device",
+            "keyboard.device",
+            "input.device",
+            "workbench.task",
+            "con-handler",
+            "console.device",
+            "FileSystem.resource",
+            "dos.library",
+            "A4000 bonus",
+            "filesystem",
+            "graphics.library",
+            "ram-handler",
+            "romboot",
+            "strap",
+            "utility.library",
+            "disk.resource",
+            "ramlib",
+            "misc.resource",
+            "icon.library",
+            "mathffp.library",
+            "ramdrive.device",
+            "battclock.resource",
+            "shell",
+            "expansion.library",
+            "diag init",
+            "mathieeesingbas.library",
+            "trackdisk.device",
+            "keymap.library",
+            "intuition.library",
+            "gadtools.library",
+            "workbench.library",
+            "potgo.resource",
+        ],
+    },
+    KnownRom {
+        check_sum: 0x47BC_EC13,
+        machine: "A4000T",
+        rom_rev: (40, 70),
+        exec_rev: (40, 10),
+        devices: &[
+            "exec.library",
+            "alert.hook",
+            "timer.device",
+            "ramdrive.device",
+            "expansion.library",
+            "diag init",
+            "scsi.device",
+            "NCR scsi.device",
+            "gameport.device",
+            "keyboard.device",
+            "input.device",
+            "utility.library",
+            "misc.resource",
+            "ram-handler",
+            "workbench.task",
+            "con-handler",
+            "console.device",
+            "disk.resource",
+            "dos.library",
+            "A4000 bonus",
+            "filesystem",
+            "graphics.library",
+            "bootmenu",
+            "syscheck",
+            "mathieeesingbas.library",
+            "layers.library",
+            "mathffp.library",
+            "ramlib",
+            "battmem.resource",
+            "icon.library",
+            "wbfind",
+            "cia.resource",
+            "audio.device",
+            "shell",
+            "keymap.library",
+            "romboot",
+            "strap",
+            "trackdisk.device",
+            "battclock.resource",
+            "intuition.library",
+            "gadtools.library",
+            "potgo.resource",
+            "FileSystem.resource",
+        ],
+    },
+    KnownRom {
+        check_sum: 0x9FDE_EEF6,
+        machine: "A600",
+        rom_rev: (40, 63),
+        exec_rev: (40, 10),
+        devices: &[
+            "exec.library",
+            "alert.hook",
+            "audio.device",
+            "gameport.device",
+            "keyboard.device",
+            "input.device",
+            "graphics.library",
+            "dos.library",
+            "filesystem",
+            "console.device",
+            "layers.library",
+            "scsi.device",
+            "con-handler",
+            "bootmenu",
+            "syscheck",
+            "timer.device",
+            "expansion.library",
+            "diag init",
+            "utility.library",
+            "battclock.resource",
+            "carddisk.device",
+            "cia.resource",
+            "FileSystem.resource",
+            "battmem.resource",
+            "potgo.resource",
+            "misc.resource",
+            "workbench.task",
+            "disk.resource",
+            "ramdrive.device",
+            "mathffp.library",
+            "keymap.library",
+            "romboot",
+            "strap",
+            "card.resource",
+            "mathieeesingbas.library",
+            "trackdisk.device",
+            "icon.library",
+            "ram-handler",
+            "shell",
+            "intuition.library",
+            "gadtools.library",
+            "workbench.library",
+            "ramlib",
+        ],
+    },
+];
 
 /// The aggregate result of every [`KickRom`] check, matching `romtool
 /// info`'s field set (plus [`RomInfo::doubled_ok`], which `romtool`
@@ -2443,6 +2892,89 @@ mod scan_tests {
         // structurally-valid-looking matchword scan yields nothing.
         let short = vec![0u8; 10];
         assert_eq!(KickRom::new(&short).scan().count(), 0);
+    }
+
+    // --- machine_hints ---------------------------------------------------
+
+    #[test]
+    fn machine_hints_reads_named_machine_from_bonus_resident() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        write_cstr(&mut img, 0x500, b"A3000 bonus");
+        write_resident(&mut img, 0x300, base, 0, 1, 8, 0, base + 0x500, 0, 0, 0);
+
+        let hints = KickRom::new(&img).machine_hints();
+        assert_eq!(hints.named_machine, Some(&b"A3000"[..]));
+        assert!(!hints.has_pcmcia);
+        assert!(!hints.has_ncr_scsi);
+    }
+
+    #[test]
+    fn machine_hints_detects_pcmcia_and_ncr_scsi() {
+        let mut img = base_image();
+        let base = DEFAULT_BASE_512K;
+        write_cstr(&mut img, 0x500, b"card.resource");
+        write_cstr(&mut img, 0x520, b"NCR scsi.device");
+        write_resident(&mut img, 0x300, base, 0, 1, 8, 0, base + 0x500, 0, 0, 0);
+        write_resident(&mut img, 0x340, base, 0, 1, 3, 0, base + 0x520, 0, 0, 0);
+
+        let hints = KickRom::new(&img).machine_hints();
+        assert!(hints.named_machine.is_none());
+        assert!(hints.has_pcmcia);
+        assert!(hints.has_ncr_scsi);
+    }
+
+    #[test]
+    fn machine_hints_all_false_when_no_signal_present() {
+        // A plain valid image with no matching residents at all: no
+        // wrong guess, just no signal.
+        let img = base_image();
+        let hints = KickRom::new(&img).machine_hints();
+        assert!(hints.named_machine.is_none());
+        assert!(!hints.has_pcmcia);
+        assert!(!hints.has_ncr_scsi);
+    }
+}
+
+#[cfg(test)]
+mod identify_tests {
+    use super::*;
+
+    #[test]
+    fn identify_finds_a_known_checksum() {
+        let rom = identify(0x8F4C_0C67, KNOWN_ROMS).unwrap();
+        assert_eq!(rom.machine, "A3000");
+        assert_eq!(rom.rom_rev, (40, 68));
+        assert_eq!(rom.exec_rev, (40, 10));
+        assert!(rom.devices.contains(&"A3000 bonus"));
+    }
+
+    #[test]
+    fn identify_returns_none_for_an_unknown_checksum() {
+        assert!(identify(0xDEAD_BEEF, KNOWN_ROMS).is_none());
+    }
+
+    #[test]
+    fn identify_works_against_a_caller_supplied_table() {
+        let custom = [KnownRom {
+            check_sum: 0x1234_5678,
+            machine: "CustomMachine",
+            rom_rev: (1, 0),
+            exec_rev: (1, 0),
+            devices: &["exec.library"],
+        }];
+        let rom = identify(0x1234_5678, &custom).unwrap();
+        assert_eq!(rom.machine, "CustomMachine");
+        assert!(identify(0x1234_5678, KNOWN_ROMS).is_none());
+    }
+
+    #[test]
+    fn known_roms_table_has_no_duplicate_checksums() {
+        for (i, a) in KNOWN_ROMS.iter().enumerate() {
+            for b in &KNOWN_ROMS[i + 1..] {
+                assert_ne!(a.check_sum, b.check_sum, "duplicate checksum in KNOWN_ROMS");
+            }
+        }
     }
 }
 

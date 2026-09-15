@@ -32,6 +32,9 @@
 //!   outside the image, unterminated name/id strings). Collecting into
 //!   a `Vec` also proves the iterator terminates on adversarial input,
 //!   not just that each step doesn't panic.
+//! * `machine_hints()` — iterates `scan()` internally, so no new panic
+//!   surface, but called explicitly per this file's own convention of
+//!   fuzzing every new entry point.
 //! * `merge_hi_lo` — the input is split into two halves (front/back) and
 //!   fed in as the hi/lo pair, so mismatched-length and odd-length
 //!   inputs are reached as directly as split-in-half arithmetic allows.
@@ -178,6 +181,10 @@ fuzz_target!(|data: &[u8]| {
 
     // --- scan: must terminate and never panic on adversarial input -----
     let _: Vec<_> = rom.scan().collect();
+
+    // --- machine_hints: iterates scan(), no new panic surface, but ------
+    // --- fuzzed explicitly per this file's convention -------------------
+    let _ = rom.machine_hints();
 
     // --- merge_hi_lo: split the input in half as a hi/lo pair -----------
     let mid = data.len() / 2;

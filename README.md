@@ -35,6 +35,13 @@ Milestones 1–5 are complete:
   512 KiB images (with a documented, tested fix for `romtool combine`'s
   surprising reversed argument order), and a two-pass verify-then-apply
   binary patch primitive that never leaves a buffer half-patched.
+- **Machine identification** (`KickRom::machine_hints`, `identify`) —
+  best-effort machine-model signals read from a ROM's residents (a
+  literal `"<machine> bonus"` module, PCMCIA support, the A4000T's
+  distinct SCSI controller), plus a checksum-keyed lookup with a small
+  seed table for identifying a ROM from its checksum alone. Not a
+  `romtool` feature — this crate's own addition, explicitly a
+  heuristic rather than a guaranteed fact.
 
 Verified throughout via a differential harness against `romtool`, a
 sweep of real ROM dumps, and 40M+ fuzz executions with zero crashes.

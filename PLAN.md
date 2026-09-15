@@ -482,6 +482,89 @@ milestone 2.)
       `ResidentScan`, which all exist by now; no new API unless the
       CLI proves something missing (in which case it gets added here
       first).
+- [x] **Machine identification** — implemented per the design below,
+      and re-verified against all 7 real ROM files this session
+      touched (not just the synthetic fixtures the unit tests use):
+      every `identify(read_check_sum(), KNOWN_ROMS)` lookup matched
+      the expected machine exactly, and `machine_hints` behaved
+      exactly as documented on the A4000T case specifically — it
+      correctly reports `named_machine: Some("A4000")` (the `bonus`
+      resident doesn't distinguish the tower variant) with
+      `has_ncr_scsi: true` as the actual differentiator, not a
+      fabricated `"A4000T"`. 12 new tests (3 `machine_hints`, 4
+      `identify`, plus the doubled-checksum table invariant). Added to
+      the fuzz target (`machine_hints`, no new panic surface since it
+      only iterates the already-fuzzed `scan()`, but included per this
+      project's own convention of fuzzing every new entry point). — new item, raised post-0.3.0 (not
+      in `romtool` at all; this crate's own addition, grilled
+      2026-09-15). Two complementary pieces, both decided:
+
+      **1. `KickRom::machine_hints` — resident-based heuristic, built
+      entirely on the existing `ResidentScan` primitive, no new
+      low-level parsing.** Confirmed empirically against five real 3.1
+      ROMs (A600/A1200/A3000/A4000/A4000T, this session) that
+      Commodore embeds real machine-identifying signal in resident
+      names:
+      - A **literal machine-name resident**: the A3000 ROM carries a
+        resident named exactly `"A3000 bonus"`; A4000 and A4000T carry
+        `"A4000 bonus"` (confirmed present even back in the 2.04 A3000
+        ROM, not just 3.1). Strip the trailing `" bonus"` for the
+        machine name.
+      - `card.resource`/`carddisk.device` (PCMCIA) present only on
+        A1200 and A600 — absent on the A3000-class machines.
+      - `NCR scsi.device` present only on A4000T, alongside the
+        `scsi.device` every machine has — its distinct SCSI
+        controller.
+
+      **Explicitly a heuristic, not a fact** — unlike everything else
+      in this crate, it's incomplete by construction: plenty of real
+      ROMs (2.04-era non-A3000 dumps not yet sampled, CD32, CDTV,
+      AROS) may carry none of these markers, and `machine_hints` on
+      such an image correctly returns all-`None`/`false`, not a wrong
+      guess. Shape: a small struct (`named_machine: Option<&[u8]>`,
+      `has_pcmcia: bool`, `has_ncr_scsi: bool`) returned by a method
+      that iterates `self.scan()` once. No restricted data involved —
+      these are plaintext module names Commodore put in the ROM,
+      visible to anyone who scans it.
+
+      **2. `identify`/`KnownRom` — checksum-keyed lookup, mechanism +
+      a small seed table.** Same shape as milestone 4's already-grilled
+      `ModuleSpec` precedent (plain data, no trait — `identify(check_sum:
+      u32, table: &[KnownRom]) -> Option<KnownRom>`), because the
+      checksum-only case (`machine_hints` needs the actual ROM bytes;
+      this doesn't) is a genuinely different use case worth its own
+      mechanism, not because polymorphism is needed. **Not the
+      milestone-4 licensing situation** — checksum→version/machine
+      metadata is publicly documented (Cloanto's own "ROM Types
+      Summary" page, already cited in this project's Cloanto
+      research; Wikipedia's Kickstart version history), unlike
+      Doobrey's restricted split-boundary data, so a small seed table
+      ships in the crate rather than staying caller-supplied-only.
+      `devices: &[&str]` on each entry is the ROM's resident name list
+      — genuinely useful for the checksum-only case (no bytes to scan
+      yet), redundant with `ResidentScan` when the bytes *are* in
+      hand.
+
+      **Seed table — 7 entries, each independently verified this
+      session** (stored `check_sum` read directly, `rom_rev`/`exec_rev`
+      cross-checked against `info()`, `devices` from an actual
+      `scan()` run — not copied from any external database):
+
+      | check_sum | machine | rom_rev | exec_rev |
+      |---|---|---|---|
+      | `0x150B7DB3` | A3000 | 34.5 | 34.2 | (Kickstart 1.3)
+      | `0x54876DAB` | A3000 | 37.175 | 37.132 | (2.04)
+      | `0x87BA7A3E` | A1200 | 40.68 | 40.10 | (3.1)
+      | `0x8F4C0C67` | A3000 | 40.68 | 40.10 | (3.1)
+      | `0x45C3145E` | A4000 | 40.68 | 40.10 | (3.1)
+      | `0x47BCEC13` | A4000T | 40.70 | 40.10 | (3.1)
+      | `0x9FDEEEF6` | A600 | 40.63 | 40.10 | (3.1)
+
+      "Small, seeded, extendable" per the grilled decision — not an
+      attempt at exhaustive coverage (that would be a maintenance
+      commitment this crate hasn't signed up for); a caller with more
+      entries passes their own `&[KnownRom]` to the same `identify`
+      function.
 
 ## Milestone 4 — split (modules), scoped down
 
