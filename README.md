@@ -2,7 +2,8 @@
 
 A pure-Rust, `no_std` + `alloc` library for Amiga Kickstart ROM images:
 normalizing raw dumps (byte-order variants, Cloanto/Amiga Forever
-encoding, hi/lo EPROM splits) and inspecting/validating a canonical image.
+encoding, ReKick/ReCode "DEADFEED" encoding, KickIt's wrapper header,
+hi/lo EPROM splits) and inspecting/validating a canonical image.
 
 Independent implementation against the public Kickstart ROM header/footer
 format — not a port of amitools' GPL-3 `romtool`. Every fact this crate
@@ -24,8 +25,9 @@ Zero dependencies. MSRV 1.63. Licensed under MIT OR Apache-2.0.
 Milestones 1–5 are complete:
 
 - **Normalize + inspect** (`Loader`, `KickRom::info`) — byte-order
-  detection/reordering, Cloanto decode, hi/lo split/merge, every header/
-  footer/checksum check (including `check_doubled`, for the common real
+  detection/reordering, Cloanto decode, ReKick/ReCode "DEADFEED" decode,
+  KickIt header stripping, hi/lo split/merge, every header/footer/
+  checksum check (including `check_doubled`, for the common real
   Kickstart 1.3 padding-by-duplication layout), all bounds-checked
   against arbitrary input.
 - **Scan** (`KickRom::scan`) — an allocation-free iterator over the
