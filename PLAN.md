@@ -412,12 +412,12 @@ Ordered so each item's tests exist before or with it.
       split→merge round-trip property test; `LoaderError` variants
       for size mismatches settled (`MismatchedHiLoLength` exists;
       likely add odd-size / not-a-ROM-size).
-- [x] **ReKick/ReCode and KickIt container formats** — new item, added
-      post-0.4.0 after a reader pointed at
+- [x] **ReKick/ReCode, KickIt, and KICK floppy container formats** —
+      new item, added post-0.4.0 after a reader pointed at
       <http://capitoline.twocatsblack.com/>, a hobbyist Kickstart
       editing tool's documentation site (plain HTTP only — fetch with
       `curl`, not `WebFetch`, which force-upgrades to `https://` and
-      gets `ECONNREFUSED`). Two more raw-dump containers, both decoded
+      gets `ECONNREFUSED`). Three more raw-dump containers, all decoded
       key-free so they slot into `Loader::detect`/`normalize` the same
       way the byte-order permutations do (unlike Cloanto, which needs a
       caller-supplied key). Full facts, with the explicit caveat that
@@ -442,16 +442,40 @@ Ordered so each item's tests exist before or with it.
         only when the declared size is exactly 256 KiB/512 KiB and
         matches the actual remaining length; `normalize` just strips
         the 8 bytes.
-      - **Deliberately not done**: no encode direction for either
-        (same reasoning as Cloanto — this crate reads real dumps, it
-        doesn't produce distributable ReKick/KickIt files), and no
-        attempt to generalize beyond the one documented header
-        length/shape of each — a different real-world variant is a
-        reason to extend this item, not to guess ahead of evidence.
-      - 6 new unit tests (detect/reject/round-trip for both formats);
-        covered by the existing fuzz target automatically, since it
-        already calls `Loader::detect`/`normalize` on arbitrary bytes
-        — no fuzz-target code change needed for the new branches.
+      - **`RomEncoding::KickFloppyWrapped`** — added in a follow-up
+        session after the user pointed at the same site's `physical`
+        page: the A1000's non-DOS "KICK" bootstrap floppy (its own tiny
+        8 KiB ROM loads a 256 KiB Kickstart from floppy into RAM at
+        boot, since the A1000 has no Kickstart ROM socket at all) is
+        identified by a 4-byte `"KICK"` magic at offset 0, with the
+        Kickstart payload at a fixed offset of 512 bytes. Detected only
+        when the remaining length is exactly 256 KiB (the A1000's only
+        Kickstart size — unlike KickIt, there's no size field to
+        cross-check, so this is the sole guard against misclassifying
+        an unrelated file); `normalize` strips the 512-byte header.
+        Weaker-sourced than ReKick/KickIt even by this item's own
+        PROBABLE standard — no second-page cross-check exists for it
+        the way `hash-files` corroborated ReKick's header length.
+        **Explicitly scoped out, considered and rejected in the same
+        session**: the A3000 SuperKickstart floppy (`"KICKSUP0"`,
+        bundles two Kickstarts + two Bonus blobs, doesn't fit a single
+        `Vec<u8>` result) and DOS-formatted relocation floppies
+        (Relokick/Tude, need a real filesystem parser — `amiga-ffs-rs`'s
+        job, not this crate's) — both documented in the research doc's
+        "KICK floppy container" section as deliberate non-goals for
+        this pass, not oversights.
+      - **Deliberately not done** (all three formats): no encode
+        direction (same reasoning as Cloanto — this crate reads real
+        dumps, it doesn't produce distributable output in any of these
+        formats), and no attempt to generalize beyond the one
+        documented header length/shape/offset of each — a different
+        real-world variant is a reason to extend this item, not to
+        guess ahead of evidence.
+      - 9 new unit tests total across the three formats
+        (detect/reject/round-trip each); covered by the existing fuzz
+        target automatically, since it already calls
+        `Loader::detect`/`normalize` on arbitrary bytes — no
+        fuzz-target code change needed for the new branches.
 - [x] **Error shape audit.** `LoaderError::NotYetImplemented` is
       deleted (it exists only to keep stubs honest); remaining
       variants reviewed against "every failure a caller can act on
@@ -930,10 +954,24 @@ searching for Doobrey's or Troller's restricted files.
       case**: real ROMs whose `rt_EndSkip` conventionally equals the
       next module's start (the common, RKRM-documented case) get
       `end_skip_hint: None`, same as before — this only surfaces
-      information for modules whose author set a tighter `rt_EndSkip`,
-      and whether real Kickstart ROMs do that often enough to matter is
-      unverified (no real ROM bytes available to check; flagged for a
-      future `AMIGA_ROM_DIR`-local session). 8 new unit tests
+      information for modules whose author set a tighter `rt_EndSkip`.
+      **Real-ROM validated in a follow-up session** against ~70 real
+      Kickstart dumps the developer legally owns (`~/Documents/
+      Amiberry/Roms` + `.../Kickstarts`, versions 1.0-3.2.x across
+      A500-A4000T/CD32, plus AROS) via a throwaway local program (not
+      committed — no test here depends on these files) reporting
+      aggregate counts only: **51.7%/56.0%** of residents (two
+      directories, ~2600 residents total) got a `Some` hint — a real,
+      frequently-firing signal, not a theoretical curiosity. One
+      pattern recorded for future reference: Hyperion's 3.2.x-era
+      builds showed a far lower rate (~1/42-43 per ROM) than every
+      Commodore-era build sampled (~18-30/20-45) — a build-convention
+      difference, not a bug. `find_relocations` against a real same-
+      build/different-base pair stays unvalidated: this collection is
+      entirely physical dumps at each machine's standard base, no
+      softloaded/relocated copy of the same build to diff against —
+      needs a different kind of sample. Full writeup:
+      `docs/research/module-boundary-detection.md` §3.2. 8 new unit tests
       (`boundary_tests`, up from 4): hint present when strictly inside
       the bound, absent with no `base_addr`, absent when equal to
       `end_upper_bound` (the conventional case), absent for three

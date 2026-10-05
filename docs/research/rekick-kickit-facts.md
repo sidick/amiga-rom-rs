@@ -1,17 +1,22 @@
-# Milestone-2 facts: ReKick/ReCode "DEADFEED" encoding, and the KickIt container
+# Milestone-2 facts: ReKick/ReCode "DEADFEED" encoding, KickIt, and the KICK floppy
 
-Research backing the `RomEncoding::ReKickEncoded` / `RomEncoding::KickItWrapped`
+Research backing the `RomEncoding::ReKickEncoded` /
+`RomEncoding::KickItWrapped` / `RomEncoding::KickFloppyWrapped`
 additions to `Loader`. Unlike every other fact in this crate's research
 docs, this one is **not** oracle-verified against real ROM bytes or
 cross-checked against a second independent source — it rests on a single
 secondary source, a blog post. Treat it as **PROBABLE**, not CONFIRMED,
-until someone verifies it against a real ReKick/ReCode or KickIt file (no
-such file is available in this project to test against).
+until someone verifies it against a real ReKick/ReCode, KickIt, or KICK
+floppy file (no such file is available in this project to test
+against — the large real-Kickstart sample used elsewhere this session,
+see `module-boundary-detection.md` §3.2, is all plain physical-ROM
+dumps, none of these three container formats).
 
 ## Source
 
-<http://capitoline.twocatsblack.com/index.php/digital/> and
-<http://capitoline.twocatsblack.com/index.php/hash-files/> — "Capitoline",
+<http://capitoline.twocatsblack.com/index.php/digital/>,
+<http://capitoline.twocatsblack.com/index.php/hash-files/>, and
+<http://capitoline.twocatsblack.com/index.php/physical/> — "Capitoline",
 a hobbyist Kickstart ROM editing/patching tool's own documentation site.
 Plain HTTP only (no TLS listener on that host as of 2026-10-05); fetched
 with `curl`, not `WebFetch` (which force-upgrades to `https://` and fails
@@ -77,15 +82,54 @@ zero bytes plus a declared size matching
 data length — both conditions required, so a file that merely starts
 with four zero bytes (not a real KickIt header) doesn't false-positive.
 
+## KICK floppy container (A1000 bootstrap)
+
+The A1000 has no physical Kickstart ROM at all — a small 8 KiB
+"bootstrap" ROM instead loads the real (256 KiB) Kickstart from a
+floppy into "write-once" RAM at boot. Per the `physical` page, that
+floppy is **not DOS-formatted** — it's identified purely by its first
+four bytes being the ASCII magic `"KICK"` (`0x4B49434B`), with the
+actual 256 KiB Kickstart payload starting at a **fixed byte offset of
+512** and read sequentially from there.
+
+**Detection** (`KICK_FLOPPY_MAGIC`/`KICK_FLOPPY_HEADER_LEN` in
+`src/lib.rs`): the 4-byte magic, plus a remaining length of exactly
+[`ROM_SIZE_256K`] after the fixed 512-byte header — the source only
+ever documents this for the A1000's one Kickstart size, so (unlike
+KickIt's self-declared size) there's no 512 KiB variant to accept.
+
+Unlike ReKick/KickIt, this one has no cross-check from a second page on
+the same site (no `hash-files`-style worked example naming the exact
+offset) — treat its confidence as, if anything, slightly weaker than
+ReKick/KickIt's already-PROBABLE status, pending a real sample.
+
+**Explicitly out of scope, considered and rejected this session**: the
+A3000 **SuperKickstart floppy** (`"KICKSUP0"` magic), also described on
+the `physical` page, bundles *two* Kickstarts (1.3 and 2.x) plus two
+"Bonus" code blobs at fixed offsets — it doesn't produce a single
+canonical image the way `Loader::normalize`'s `Result<Vec<u8>, _>`
+shape expects, so it doesn't fit this function at all. Extracting from
+it would need a dedicated multi-component type, which is a real design
+decision (how many components, named how, is this `Loader`'s job or a
+different one) deferred rather than rushed. Likewise the DOS-formatted
+relocation floppies (Relokick/Tude, also on that page) are out of scope
+entirely: those need a real AmigaDOS filesystem parser (`amiga-ffs-rs`'s
+job), not anything this crate's "no file I/O, just bytes" model should
+grow into.
+
 ## What's deliberately not implemented
 
-- **No encode direction** for either format — same reasoning as
-  Cloanto: this crate's `Loader` only reads real dumps a caller already
-  has, it doesn't produce ReKick/KickIt-formatted output for burning or
-  distribution.
-- **Container variants with a different header length, or a size other
-  than 256 KiB/512 KiB, are not recognized** — the source only
-  documents the one 108-byte/DEADFEED shape and one KickIt example; if
-  a real-world sample turns up with a different shape, extend
-  `REKICK_HEADER_LEN`/the size check then, per this crate's "don't
-  invent facts past what's confirmed" discipline.
+- **No encode direction** for any of the three formats — same reasoning
+  as Cloanto: this crate's `Loader` only reads real dumps a caller
+  already has, it doesn't produce ReKick/KickIt/KICK-floppy-formatted
+  output for burning or distribution.
+- **Container variants with a different header length/offset, or a
+  size other than what's documented, are not recognized** — the source
+  only documents the one 108-byte/DEADFEED shape, one KickIt example,
+  and one fixed KICK-floppy offset; if a real-world sample turns up
+  with a different shape, extend the relevant constant/size check then,
+  per this crate's "don't invent facts past what's confirmed"
+  discipline.
+- **SuperKickstart (`"KICKSUP0"`) and DOS-formatted relocation floppies
+  (Relokick/Tude)** — see the previous section for why each is out of
+  scope for this pass.

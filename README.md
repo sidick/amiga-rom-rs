@@ -3,7 +3,8 @@
 A pure-Rust, `no_std` + `alloc` library for Amiga Kickstart ROM images:
 normalizing raw dumps (byte-order variants, Cloanto/Amiga Forever
 encoding, ReKick/ReCode "DEADFEED" encoding, KickIt's wrapper header,
-hi/lo EPROM splits) and inspecting/validating a canonical image.
+the A1000 KICK floppy's fixed-offset payload, hi/lo EPROM splits) and
+inspecting/validating a canonical image.
 
 Independent implementation against the public Kickstart ROM header/footer
 format — not a port of amitools' GPL-3 `romtool`. Every fact this crate
@@ -26,10 +27,10 @@ Milestones 1–5 are complete:
 
 - **Normalize + inspect** (`Loader`, `KickRom::info`) — byte-order
   detection/reordering, Cloanto decode, ReKick/ReCode "DEADFEED" decode,
-  KickIt header stripping, hi/lo split/merge, every header/footer/
-  checksum check (including `check_doubled`, for the common real
-  Kickstart 1.3 padding-by-duplication layout), all bounds-checked
-  against arbitrary input.
+  KickIt and KICK-floppy header stripping, hi/lo split/merge, every
+  header/footer/checksum check (including `check_doubled`, for the
+  common real Kickstart 1.3 padding-by-duplication layout), all
+  bounds-checked against arbitrary input.
 - **Scan** (`KickRom::scan`) — an allocation-free iterator over the
   ROM's `Resident` (RomTag) structures, matching `romtool scan` exactly
   against real ROMs.
@@ -59,7 +60,9 @@ problem rather than a quick implementation) is in progress. See
 for the design and `PLAN.md` for status. Two primitives have landed so
 far — `module_boundaries` (a safe upper bound on each resident module's
 extent, plus an optional `end_skip_hint` that surfaces the module's own
-`rt_EndSkip` only when it's consistent with that bound) and
+`rt_EndSkip` only when it's consistent with that bound — real-ROM
+validated to fire on ~55% of residents across ~70 real Kickstart dumps)
+and
 `find_relocations` (a generic two-buffer RELOC detector) — with a
 general tighter-end-offset solution and catalog assembly still open.
 

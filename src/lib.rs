@@ -12,9 +12,11 @@
 //! - [`Loader`] turns whatever bytes a user actually has — byte-swapped,
 //!   [Cloanto/Amiga Forever-encoded](RomEncoding::CloantoEncoded),
 //!   [ReKick/ReCode-encoded](RomEncoding::ReKickEncoded),
-//!   [KickIt-wrapped](RomEncoding::KickItWrapped), or a split hi/lo
-//!   EPROM pair ([`merge_hi_lo`]/[`split_hi_lo`]) — into a canonical raw
-//!   image. These need `alloc`, since they own the output buffer.
+//!   [KickIt-wrapped](RomEncoding::KickItWrapped),
+//!   [a KICK floppy image](RomEncoding::KickFloppyWrapped), or a split
+//!   hi/lo EPROM pair ([`merge_hi_lo`]/[`split_hi_lo`]) — into a
+//!   canonical raw image. These need `alloc`, since they own the output
+//!   buffer.
 //! - [`KickRom`] inspects/validates a canonical image: allocation-free,
 //!   borrowing the caller's `&[u8]`.
 //!
@@ -54,11 +56,13 @@
 //! generic find/verify/replace over a ROM buffer, with no actual patch
 //! data (e.g. `1mb_rom`) shipped — see those items' doc comments and
 //! `PLAN.md`'s "Milestone 5" section. Post-0.4.0, the loader also
-//! recognizes and decodes two more container formats discovered via
+//! recognizes and decodes more container formats discovered via
 //! independent research (Capitoline's Kickstart documentation):
-//! [`RomEncoding::ReKickEncoded`] (the "DEADFEED" chained-XOR format)
-//! and [`RomEncoding::KickItWrapped`] (a trivial zero/size header) —
-//! see `PLAN.md`'s milestone-2 "ReKick/ReCode and KickIt" item.
+//! [`RomEncoding::ReKickEncoded`] (the "DEADFEED" chained-XOR format),
+//! [`RomEncoding::KickItWrapped`] (a trivial zero/size header), and
+//! [`RomEncoding::KickFloppyWrapped`] (the A1000 bootstrap floppy's
+//! fixed-offset payload) — see `PLAN.md`'s milestone-2 "ReKick/ReCode,
+//! KickIt, and KICK floppy" item.
 //! Milestone 6 (independent module-boundary detection, deliberately
 //! last) is research-in-progress: see
 //! `docs/research/module-boundary-detection.md` for the full design and
@@ -118,6 +122,21 @@ const REKICK_INITIAL_KEY: [u8; 4] = [0xDE, 0xAD, 0xFE, 0xED];
 /// PLAN.md's milestone-2 ReKick/KickIt item.
 const KICKIT_HEADER_LEN: usize = 8;
 
+/// The A1000 bootstrap "KICK" floppy's 4-byte ASCII magic at offset 0 —
+/// a non-DOS-formatted disk whose own tiny bootstrap ROM (not handled
+/// by this crate) reads the Kickstart payload starting at a fixed byte
+/// offset ([`KICK_FLOPPY_HEADER_LEN`]). Independently described at
+/// <http://capitoline.twocatsblack.com/index.php/physical/> — see
+/// PLAN.md's milestone-2 "KICK floppy" item. No real sample available
+/// to verify against (same PROBABLE-confidence caveat as ReKick/KickIt).
+const KICK_FLOPPY_MAGIC: &[u8] = b"KICK";
+/// Fixed byte offset where the A1000 "KICK" floppy's Kickstart payload
+/// begins, per the source cited on [`KICK_FLOPPY_MAGIC`]. Documented
+/// only for a 256 KiB payload (the A1000's only Kickstart size), so
+/// detection requires the remaining length to be exactly
+/// [`ROM_SIZE_256K`].
+const KICK_FLOPPY_HEADER_LEN: usize = 512;
+
 /// Byte order of a raw ROM dump relative to the canonical big-endian
 /// layout. Real dumps show up in all four of these, depending on the
 /// source machine's ROM socket/bus width — see `PLAN.md`'s loader
@@ -151,6 +170,10 @@ pub enum RomEncoding {
     /// a big-endian size) wrapping an otherwise-canonical softloaded
     /// image. No key is required.
     KickItWrapped,
+    /// The A1000 bootstrap "KICK" floppy's container: a 4-byte `"KICK"`
+    /// magic, then a fixed-offset, otherwise-canonical 256 KiB
+    /// Kickstart payload. No key is required.
+    KickFloppyWrapped,
 }
 
 /// Errors from [`Loader`] and the hi/lo split/merge functions.
@@ -261,19 +284,20 @@ impl Loader {
     /// Inspects leading bytes against known boot-vector signatures under
     /// all four [`ByteOrder`] permutations (plus the Cloanto
     /// `AMIROMTYPE1` container magic, the ReKick/ReCode plaintext-header
-    /// magic, and KickIt's zero-prefixed size header), and classifies.
-    /// Does not decode/reorder — see [`Loader::normalize`] for that.
+    /// magic, KickIt's zero-prefixed size header, and the A1000 "KICK"
+    /// floppy's magic), and classifies. Does not decode/reorder — see
+    /// [`Loader::normalize`] for that.
     ///
     /// Returns `None` when `data` doesn't match anything recognized —
     /// too short (fewer than 8 bytes, unless it matches the Cloanto
     /// magic, which only needs its own 11 bytes), or its first longword
     /// doesn't match the boot-vector signature table under any
-    /// permutation. The ReKick/KickIt containers are only classified
-    /// when their declared/implied payload length is exactly
-    /// [`ROM_SIZE_256K`] or [`ROM_SIZE_512K`] — anything else falls
-    /// through to the raw boot-vector check (and likely `None`), rather
-    /// than reporting a container match [`Loader::normalize`] can't
-    /// actually decode.
+    /// permutation. The ReKick/KickIt/KICK-floppy containers are only
+    /// classified when their declared/implied payload length is exactly
+    /// [`ROM_SIZE_256K`] or [`ROM_SIZE_512K`] (KICK-floppy only ever
+    /// 256 KiB) — anything else falls through to the raw boot-vector
+    /// check (and likely `None`), rather than reporting a container
+    /// match [`Loader::normalize`] can't actually decode.
     ///
     /// Matching proceeds: for each table entry and each permutation,
     /// compare the image's raw first big-endian `u32` against the
@@ -307,6 +331,13 @@ impl Loader {
                 && data.len() - KICKIT_HEADER_LEN == size
             {
                 return Some(RomEncoding::KickItWrapped);
+            }
+        }
+        if data.starts_with(KICK_FLOPPY_MAGIC) {
+            if let Some(payload_len) = data.len().checked_sub(KICK_FLOPPY_HEADER_LEN) {
+                if payload_len == ROM_SIZE_256K {
+                    return Some(RomEncoding::KickFloppyWrapped);
+                }
             }
         }
         if data.len() < 8 {
@@ -348,6 +379,7 @@ impl Loader {
             }
             Some(RomEncoding::ReKickEncoded) => Ok(decode_rekick(&data[REKICK_HEADER_LEN..])),
             Some(RomEncoding::KickItWrapped) => Ok(data[KICKIT_HEADER_LEN..].to_vec()),
+            Some(RomEncoding::KickFloppyWrapped) => Ok(data[KICK_FLOPPY_HEADER_LEN..].to_vec()),
             Some(RomEncoding::Raw(ByteOrder::Normal)) => Ok(data.to_vec()),
             Some(RomEncoding::Raw(order)) => {
                 if data.len() % 4 != 0 {
@@ -2670,6 +2702,32 @@ mod tests {
         let plain = synthetic_rom(RomFixtureParams::new_512k());
         let mut data = vec![0u8; KICKIT_HEADER_LEN];
         data[4..8].copy_from_slice(&(ROM_SIZE_512K as u32).to_be_bytes());
+        data.extend_from_slice(&plain);
+        let normalized = Loader::normalize(&data, None).unwrap();
+        assert_eq!(normalized, plain);
+    }
+
+    #[test]
+    fn detect_recognizes_kick_floppy_header() {
+        let mut data = vec![0u8; KICK_FLOPPY_HEADER_LEN];
+        data[..KICK_FLOPPY_MAGIC.len()].copy_from_slice(KICK_FLOPPY_MAGIC);
+        data.extend_from_slice(&[0xAAu8; ROM_SIZE_256K]);
+        assert_eq!(Loader::detect(&data), Some(RomEncoding::KickFloppyWrapped));
+    }
+
+    #[test]
+    fn detect_rejects_kick_floppy_header_with_wrong_payload_length() {
+        let mut data = vec![0u8; KICK_FLOPPY_HEADER_LEN];
+        data[..KICK_FLOPPY_MAGIC.len()].copy_from_slice(KICK_FLOPPY_MAGIC);
+        data.extend_from_slice(&[0xAAu8; ROM_SIZE_512K]);
+        assert_ne!(Loader::detect(&data), Some(RomEncoding::KickFloppyWrapped));
+    }
+
+    #[test]
+    fn normalize_strips_kick_floppy_header() {
+        let plain = synthetic_rom(RomFixtureParams::new_256k());
+        let mut data = vec![0u8; KICK_FLOPPY_HEADER_LEN];
+        data[..KICK_FLOPPY_MAGIC.len()].copy_from_slice(KICK_FLOPPY_MAGIC);
         data.extend_from_slice(&plain);
         let normalized = Loader::normalize(&data, None).unwrap();
         assert_eq!(normalized, plain);

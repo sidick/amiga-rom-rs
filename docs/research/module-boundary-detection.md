@@ -162,6 +162,43 @@ Kickstart ROMs do this often enough to matter is unverified — no real
 ROM bytes are available to this project to check — flagged for a future
 session with `AMIGA_ROM_DIR`-local, never-committed real-ROM testing.
 
+### 3.2 Real-ROM validation of `end_skip_hint` — done, in a follow-up session
+
+§3.1 left open whether real Kickstart ROMs set `rt_EndSkip` tighter than
+"next module's start" often enough for `end_skip_hint` to matter. A
+later session had legitimate local access to a large personal Amiberry
+ROM collection (`~/Documents/Amiberry/Roms` and `~/Documents/Amiberry/
+Kickstarts`) and ran a small throwaway program (not committed — no test
+in this repo depends on these files existing, per the `AMIGA_ROM_DIR`
+discipline) linking against this crate to answer the question with
+aggregate counts only, never ROM bytes or per-file content:
+
+- **`~/Documents/Amiberry/Roms`**: 29 files scanned (every file
+  `Loader::detect` classified as `Raw(Normal)` with at least one
+  `Resident` hit — expansion-card ROMs like Picasso IV/CyberStormPPC and
+  the tiny A1000/A590 boot ROMs correctly fell outside that filter, no
+  surprises there), 1008 residents total, **521 (51.7%)** got a
+  `Some` `end_skip_hint`.
+- **`~/Documents/Amiberry/Kickstarts`**: 43 files, 1634 residents,
+  **915 (56.0%)** got a hint.
+
+So: **resolved, not just plausible** — across roughly 70 distinct real
+Kickstart builds (versions 1.0 through 3.2.x, machines A500 through
+A4000T/CD32, plus AROS), `rt_EndSkip` is tighter than the next module's
+start a little over half the time. `end_skip_hint` is a real signal on
+real ROMs, not a theoretical nicety that never fires.
+
+One further pattern, worth recording for anyone extending this later:
+the Hyperion-built "3x0" (3.2.x-era) ROMs in the sample showed a
+starkly *lower* hint rate (around 1 hit out of 42-43 residents each)
+than every Commodore-era ROM (which clustered around 18-30 hits out of
+20-45). This reads as a build-convention difference — Hyperion's linker/
+toolchain appears to set `rt_EndSkip` to exactly the next module's start
+far more consistently than Commodore's did — not a bug in this crate or
+in the technique. Interesting, but not pursued further here (no claim
+about *why*, since that would need looking at a specific linker's
+behavior, out of scope for this crate).
+
 ## 4. RELOC detection via the two-ROM-diff technique
 
 ### 4.1 The technique, as a general primitive
@@ -289,16 +326,24 @@ known deltas, proving the *algorithm*, not that it works on any specific
 real Kickstart build. That real-world validation, if ever done, follows
 the `AMIGA_ROM_DIR` discipline: local-only, never committed, never used
 to "correct" the algorithm by copying an answer from restricted data.
+**Checked against the ~70-file Amiberry collection used in §3.2**: it
+doesn't contain a qualifying pair — every dump there is a physical ROM
+loaded at its machine's standard base address, none a softloaded/
+relocated copy of the same build at a different one — so this item
+stays open; it needs a genuinely different kind of sample (e.g. a
+soft-kick tool's relocated output alongside the original ROM it
+relocated), not just more physical dumps.
 
 ## 5. What remains genuinely open
 
-- Tighter module end-offset detection in general — §3.1's
+- Tighter module end-offset detection in general — §3.1/§3.2's
   `end_skip_hint` is a validated (never-exceeds-the-proven-bound) use
-  of `rt_EndSkip`, but it only tightens anything for modules whose
-  `rt_EndSkip` is itself tighter than "next module's start", and that's
-  unverified to be common on real ROMs (no real ROM bytes available to
-  check). The padding/alignment and code/data-classification heuristics
-  remain explicitly rejected, see §3.
+  of `rt_EndSkip`, confirmed (§3.2) to fire on roughly half of all
+  residents across a large real-ROM sample — but it still only
+  tightens modules whose `rt_EndSkip` happens to be set tighter than
+  "next module's start"; the other half get no tightening at all. The
+  padding/alignment and code/data-classification heuristics remain
+  explicitly rejected, see §3.
 - Any heuristic for finding non-resident-anchored modules at all (code
   with no `Resident` structure) — not attempted; likely needs either
   cross-referencing public SDK object files by signature, or accepting

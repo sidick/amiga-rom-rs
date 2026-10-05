@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this crate is
 
-`amiga-rom` is a pure-Rust, `no_std` + `alloc` library for Amiga Kickstart ROM images: normalizing raw dumps (byte-order variants, Cloanto/Amiga Forever encoding, ReKick/ReCode "DEADFEED" encoding, KickIt's wrapper header, hi/lo EPROM splits) and inspecting/validating a canonical image (`KickRom`). Zero dependencies. The `std` feature (default) adds only `std::error::Error` impls.
+`amiga-rom` is a pure-Rust, `no_std` + `alloc` library for Amiga Kickstart ROM images: normalizing raw dumps (byte-order variants, Cloanto/Amiga Forever encoding, ReKick/ReCode "DEADFEED" encoding, KickIt's wrapper header, the A1000 KICK floppy's fixed-offset payload, hi/lo EPROM splits) and inspecting/validating a canonical image (`KickRom`). Zero dependencies. The `std` feature (default) adds only `std::error::Error` impls.
 
 **This repository is the library only.** A CLI consumer lives in a separate repo/crate and depends on this one for all parsing/validation/building logic.
 
@@ -37,7 +37,7 @@ Everything operates on `&[u8]` / `&mut [u8]`. Callers (the CLI, an emulator, a t
 
 ### Two layers
 
-1. **Loader** (`Loader::detect`/`normalize`, `merge_hi_lo`/`split_hi_lo`) — turns whatever bytes a user actually has (byte-swapped, Cloanto-encoded, ReKick/ReCode-encoded, KickIt-wrapped, split hi/lo EPROM pair) into a canonical raw image. Needs `alloc` because it owns the output buffer.
+1. **Loader** (`Loader::detect`/`normalize`, `merge_hi_lo`/`split_hi_lo`) — turns whatever bytes a user actually has (byte-swapped, Cloanto-encoded, ReKick/ReCode-encoded, KickIt-wrapped, KICK-floppy-wrapped, split hi/lo EPROM pair) into a canonical raw image. Needs `alloc` because it owns the output buffer.
 
 2. **KickRom** — read-only inspection/validation of a canonical image, allocation-free, borrowing the caller's `&[u8]`. `KickRom::info()` aggregates every check into `RomInfo`, matching `romtool info`'s field set.
 
