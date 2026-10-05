@@ -112,9 +112,55 @@ future session doesn't re-litigate them without the reasoning:
   instruction."* Explicitly out of scope — PLAN.md's non-goals rule out
   m68k disassembly/execution in this crate entirely.
 
-**Conclusion for this pass**: ship the honest upper bound
+**Conclusion for the first pass**: ship the honest upper bound
 (`module_boundaries`), document it as a bound rather than an answer, and
 leave tighter-end heuristics as explicitly open future work.
+
+### 3.1 A fourth technique, added in a follow-up session: a *validated* `rt_EndSkip` hint
+
+None of the three rejected heuristics above use information the ROM
+itself already carries about where a module ends — they all guess from
+byte patterns. But `rt_EndSkip` *is* exactly that information; the
+reason it was ruled out for `end_upper_bound` is that it's
+author-supplied and self-verifies nothing the way `rt_MatchTag` does —
+not that it's useless. The insight: **`end_upper_bound` is already an
+independently-proven hard ceiling, so `rt_EndSkip` can be *checked
+against* it for free**, without ever letting it override or exceed that
+ceiling.
+
+`ModuleBoundary::end_skip_hint` does exactly this: translate
+`Resident::end_skip` (an absolute Amiga address) to a file offset using
+the already-known `base_addr` (same `wrapping_sub` translation
+`ResidentScan` already uses for `rt_Name`/`rt_IdString`), and report it
+*only* when the result lands strictly inside `(start, end_upper_bound]`
+— i.e., only when it is *consistent with* the hard bound, never when it
+would contradict it. This is not "trusting `rt_EndSkip`" in the sense
+milestone 3 rejected (letting it drive scanner control flow, or
+accepting it unconditionally as a fact) — it's a bounded corroboration
+check, same shape as checking a user-supplied value against a known
+invariant before using it, that can only ever report `None` or a value
+*inside* the already-safe envelope. A hostile ROM cannot use this to
+make a module's reported end look larger than it's structurally allowed
+to be; the worst it can do is supply a plausible-looking but wrong value
+that still passes the consistency check — which is why the field is
+named and documented as a *hint*, explicitly lower-confidence than
+`end_upper_bound`, not a second fact.
+
+This does not resolve the open problem in general: a real ROM whose
+`rt_EndSkip` equals the next module's start (the RKRM-documented
+convention, and the common case per `resident.h`'s own description of
+the field: "address exec resumes scanning from" — conventionally right
+at the next module) gives `end_skip_hint: None`, exactly as before — no
+tightening happens for the case that matters most (padding/glue code
+between modules, per §3's opening problem statement). Where it *does*
+help: a module whose author set `rt_EndSkip` to something tighter than
+"start of next module" (e.g. explicitly skipping past trailing data that
+would otherwise false-positive as a matchword, inside the module's own
+body) now surfaces that as a corroborated hint instead of this crate
+staying silent about information the ROM already offered. Whether real
+Kickstart ROMs do this often enough to matter is unverified — no real
+ROM bytes are available to this project to check — flagged for a future
+session with `AMIGA_ROM_DIR`-local, never-committed real-ROM testing.
 
 ## 4. RELOC detection via the two-ROM-diff technique
 
@@ -246,8 +292,13 @@ to "correct" the algorithm by copying an answer from restricted data.
 
 ## 5. What remains genuinely open
 
-- Tighter module end-offset detection (padding/alignment heuristics or
-  code/data classification) — explicitly deferred, see §3.
+- Tighter module end-offset detection in general — §3.1's
+  `end_skip_hint` is a validated (never-exceeds-the-proven-bound) use
+  of `rt_EndSkip`, but it only tightens anything for modules whose
+  `rt_EndSkip` is itself tighter than "next module's start", and that's
+  unverified to be common on real ROMs (no real ROM bytes available to
+  check). The padding/alignment and code/data-classification heuristics
+  remain explicitly rejected, see §3.
 - Any heuristic for finding non-resident-anchored modules at all (code
   with no `Resident` structure) — not attempted; likely needs either
   cross-referencing public SDK object files by signature, or accepting

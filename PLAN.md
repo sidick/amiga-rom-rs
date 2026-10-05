@@ -906,14 +906,42 @@ searching for Doobrey's or Troller's restricted files.
       (`boundary_tests`), including an out-of-order-input case proving
       it never panics even outside its documented precondition. Added
       to the fuzz target.
-- [ ] **Tighter end-offset detection — explicitly NOT done.** Three
-      candidate heuristics (padding/alignment stripping, code/data
-      entropy classification, disassemble-until-RTS) were considered
-      and rejected for this pass — see design doc §3 for the reasoning
-      per heuristic. None met this crate's own bar (oracle-verified or
-      NDK-cited) for being shipped as more than a guess. Open for a
-      future session; `module_boundaries`' honest upper bound is what
-      ships instead.
+- [x] **Tighter end-offset detection — partially addressed.** The three
+      original candidate heuristics (padding/alignment stripping,
+      code/data entropy classification, disassemble-until-RTS) were
+      considered and rejected — see design doc §3 for the reasoning
+      per heuristic; none met this crate's own bar (oracle-verified or
+      NDK-cited) for being shipped as more than a guess. A fourth,
+      different technique shipped instead (design doc §3.1):
+      `ModuleBoundary` gained `end_skip_hint: Option<usize>`, and
+      `module_boundaries` a new `base_addr: Option<u32>` parameter to
+      compute it. `rt_EndSkip` is still never *trusted* as a fact or
+      used to drive control flow (milestone 3's rule stands) — instead
+      it's translated to a file offset (same `wrapping_sub` convention
+      as `ResidentScan`'s pointer fields) and reported as a hint *only*
+      when it lands strictly inside `(start, end_upper_bound]`, i.e.
+      only when it's consistent with the already-proven-safe bound,
+      never when it would contradict it. A corrupt/hostile `rt_EndSkip`
+      can at worst produce a plausible-but-wrong in-range hint — it can
+      never make `end_skip_hint` exceed the hard ceiling the way
+      trusting it for control flow could. Documented explicitly as
+      lower-confidence than `end_upper_bound` (consistent-with is not
+      the same as confirmed-correct). **Still doesn't solve the general
+      case**: real ROMs whose `rt_EndSkip` conventionally equals the
+      next module's start (the common, RKRM-documented case) get
+      `end_skip_hint: None`, same as before — this only surfaces
+      information for modules whose author set a tighter `rt_EndSkip`,
+      and whether real Kickstart ROMs do that often enough to matter is
+      unverified (no real ROM bytes available to check; flagged for a
+      future `AMIGA_ROM_DIR`-local session). 8 new unit tests
+      (`boundary_tests`, up from 4): hint present when strictly inside
+      the bound, absent with no `base_addr`, absent when equal to
+      `end_upper_bound` (the conventional case), absent for three
+      distinct out-of-range/hostile values (before start, past the
+      bound, wildly out-of-range), and a wrapping-translation case that
+      proves no panic. Fuzz target updated to pass `rom.base_addr()`
+      through, exercising `end_skip_hint`'s translation on adversarial
+      input automatically.
 - [x] **`find_relocations`** — generic two-buffer RELOC-diff primitive
       implementing the technique already recorded above (same code at
       two load addresses, diff for words that shifted by exactly the

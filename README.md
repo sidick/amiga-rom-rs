@@ -58,8 +58,10 @@ problem rather than a quick implementation) is in progress. See
 [`docs/research/module-boundary-detection.md`](docs/research/module-boundary-detection.md)
 for the design and `PLAN.md` for status. Two primitives have landed so
 far — `module_boundaries` (a safe upper bound on each resident module's
-extent) and `find_relocations` (a generic two-buffer RELOC detector) —
-with tighter end-offset detection and catalog assembly still open.
+extent, plus an optional `end_skip_hint` that surfaces the module's own
+`rt_EndSkip` only when it's consistent with that bound) and
+`find_relocations` (a generic two-buffer RELOC detector) — with a
+general tighter-end-offset solution and catalog assembly still open.
 
 ## Example
 

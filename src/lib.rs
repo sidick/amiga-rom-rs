@@ -65,10 +65,13 @@
 //! `PLAN.md`'s Milestone 6 section for status. Two primitives have
 //! landed so far: [`module_boundaries`] (a safe, non-heuristic upper
 //! bound on each [`Resident`]'s extent, derived from already-trusted
-//! scan offsets) and [`find_relocations`] (a generic two-buffer RELOC
+//! scan offsets, plus an optional [`ModuleBoundary::end_skip_hint`] —
+//! a *validated* use of the module's own `rt_EndSkip`, reported only
+//! when it's consistent with the proven bound, never when it would
+//! exceed it) and [`find_relocations`] (a generic two-buffer RELOC
 //! detector for the "same code at two different load addresses"
-//! technique). Tighter end-offset detection and any catalog-assembly
-//! layer remain open.
+//! technique). A general tighter-end-offset solution and any
+//! catalog-assembly layer remain open.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -2023,9 +2026,12 @@ pub fn apply_patches(rom: &mut [u8], patches: &[PatchOp]) -> Result<(), PatchErr
 /// derived purely from [`ResidentScan`]'s already-trustworthy start
 /// offsets — see `docs/research/module-boundary-detection.md` §3 and
 /// `PLAN.md`'s Milestone 6 for why this is a *bound*, not the module's
-/// real (tighter) end: `rt_EndSkip` is deliberately never trusted (per
-/// milestone 3), and nothing else in a linked ROM self-announces where a
-/// module's own bytes actually stop.
+/// real (tighter) end: `rt_EndSkip` is deliberately never *followed*
+/// (per milestone 3's scanner, which never jumps control flow based on
+/// it), and nothing else in a linked ROM self-announces where a module's
+/// own bytes actually stop. See [`ModuleBoundary::end_skip_hint`] for a
+/// weaker, opt-in use of `rt_EndSkip` that still never contradicts this
+/// bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModuleBoundary {
     /// The module's start offset — identical to the originating
@@ -2035,11 +2041,36 @@ pub struct ModuleBoundary {
     /// start offset, or the image length for the last module. The
     /// module's real extent satisfies `start <= real_end <=
     /// end_upper_bound`; this crate does not claim `end_upper_bound`
-    /// itself is the real end.
+    /// itself is the real end. Structurally guaranteed, independent of
+    /// any single field inside the module — see [`module_boundaries`].
     pub end_upper_bound: usize,
+    /// An optional, *tighter* candidate end, derived from this module's
+    /// own [`Resident::end_skip`] — present only when that (otherwise
+    /// untrusted) author-supplied value translates to a file offset
+    /// strictly inside `(start, end_upper_bound]`, i.e. only when it is
+    /// *consistent with* the independently-proven bound above, never
+    /// when it would contradict it.
+    ///
+    /// This is deliberately a lower-confidence signal than
+    /// `end_upper_bound`: `rt_EndSkip` is documented (NDK `resident.h`,
+    /// RKRM) as "the address exec resumes scanning from after this
+    /// module" — conventionally where the next module starts, but
+    /// sometimes tighter (e.g. skipping internal data that would
+    /// otherwise false-positive as a matchword) — and nothing here
+    /// independently verifies it names the module's *actual* last byte.
+    /// A corrupt or adversarial ROM can set `rt_EndSkip` to any
+    /// in-range value without it being accurate; passing this
+    /// consistency check only means the value isn't contradicted by
+    /// structural facts, not that it's confirmed correct. `None` when
+    /// `base_addr` is unknown, when the translated value doesn't land
+    /// strictly inside `(start, end_upper_bound]`, or when it equals
+    /// `end_upper_bound` exactly (the conventional case — no tightening
+    /// signal beyond what's already known).
+    pub end_skip_hint: Option<usize>,
 }
 
-/// Derives [`ModuleBoundary`] upper bounds from a list of [`Resident`]
+/// Derives [`ModuleBoundary`] upper bounds (and, where consistent, a
+/// tighter [`ModuleBoundary::end_skip_hint`]) from a list of [`Resident`]
 /// hits, one per resident.
 ///
 /// `residents` must be sorted ascending by [`Resident::offset`] — exactly
@@ -2051,18 +2082,38 @@ pub struct ModuleBoundary {
 ///
 /// A module's end can never run past the next resident's own
 /// `rt_MatchWord`, because that word must remain intact in ROM for
-/// `exec.library`'s own boot-time scan to find it — so this bound is
-/// always safe, never wrong, only potentially loose (real Kickstart ROMs
-/// commonly have alignment padding or non-resident glue code between one
-/// module's actual last byte and the next module's start, which this
-/// function has no way to see).
-pub fn module_boundaries(residents: &[Resident], rom_len: usize) -> Vec<ModuleBoundary> {
+/// `exec.library`'s own boot-time scan to find it — so `end_upper_bound`
+/// is always safe, never wrong, only potentially loose (real Kickstart
+/// ROMs commonly have alignment padding or non-resident glue code
+/// between one module's actual last byte and the next module's start,
+/// which this function has no way to see).
+///
+/// `base_addr` (typically [`KickRom::base_addr`]) is needed to translate
+/// each resident's raw [`Resident::end_skip`] pointer (an absolute
+/// Amiga address) into a file offset, exactly like [`ResidentScan`]'s
+/// own `rt_MatchTag`/`rt_Name` translation (`ptr.wrapping_sub(base_addr)`,
+/// never panicking on overflow). `None` disables `end_skip_hint`
+/// entirely (every result gets `None` there) rather than guessing.
+pub fn module_boundaries(
+    residents: &[Resident],
+    rom_len: usize,
+    base_addr: Option<u32>,
+) -> Vec<ModuleBoundary> {
     let mut out = Vec::with_capacity(residents.len());
     for (i, resident) in residents.iter().enumerate() {
         let end_upper_bound = residents.get(i + 1).map_or(rom_len, |next| next.offset);
+        let end_skip_hint = base_addr.and_then(|base| {
+            let candidate = resident.end_skip.wrapping_sub(base) as usize;
+            if candidate > resident.offset && candidate < end_upper_bound {
+                Some(candidate)
+            } else {
+                None
+            }
+        });
         out.push(ModuleBoundary {
             start: resident.offset,
             end_upper_bound,
+            end_skip_hint,
         });
     }
     out
@@ -3868,10 +3919,10 @@ mod boundary_tests {
     use super::*;
     use alloc::vec;
 
-    /// Builds a minimal `Resident` with only `offset` populated — the
-    /// only field [`module_boundaries`] reads — leaving every other
-    /// field at an arbitrary-but-valid default.
-    fn resident_at(offset: usize) -> Resident<'static> {
+    /// Builds a minimal `Resident` with only `offset`/`end_skip`
+    /// populated — the only fields [`module_boundaries`] reads — leaving
+    /// every other field at an arbitrary-but-valid default.
+    fn resident_at(offset: usize, end_skip: u32) -> Resident<'static> {
         Resident {
             match_word: RTC_MATCHWORD,
             flags: 0,
@@ -3882,44 +3933,54 @@ mod boundary_tests {
             id_string: b"",
             init_addr: 0,
             offset,
-            end_skip: 0,
+            end_skip,
         }
     }
 
+    const BASE: u32 = 0x00F8_0000;
+
     #[test]
     fn empty_input_yields_no_boundaries() {
-        assert_eq!(module_boundaries(&[], 0x1000), vec![]);
+        assert_eq!(module_boundaries(&[], 0x1000, Some(BASE)), vec![]);
     }
 
     #[test]
     fn single_resident_bounded_by_rom_len() {
-        let residents = [resident_at(0x100)];
+        let residents = [resident_at(0x100, 0)];
         assert_eq!(
-            module_boundaries(&residents, 0x1000),
+            module_boundaries(&residents, 0x1000, Some(BASE)),
             vec![ModuleBoundary {
                 start: 0x100,
                 end_upper_bound: 0x1000,
+                end_skip_hint: None,
             }]
         );
     }
 
     #[test]
     fn consecutive_residents_bound_each_other() {
-        let residents = [resident_at(0x100), resident_at(0x300), resident_at(0x400)];
+        let residents = [
+            resident_at(0x100, 0),
+            resident_at(0x300, 0),
+            resident_at(0x400, 0),
+        ];
         assert_eq!(
-            module_boundaries(&residents, 0x1000),
+            module_boundaries(&residents, 0x1000, Some(BASE)),
             vec![
                 ModuleBoundary {
                     start: 0x100,
                     end_upper_bound: 0x300,
+                    end_skip_hint: None,
                 },
                 ModuleBoundary {
                     start: 0x300,
                     end_upper_bound: 0x400,
+                    end_skip_hint: None,
                 },
                 ModuleBoundary {
                     start: 0x400,
                     end_upper_bound: 0x1000,
+                    end_skip_hint: None,
                 },
             ]
         );
@@ -3930,13 +3991,71 @@ mod boundary_tests {
         // Not the documented precondition (ResidentScan always yields
         // ascending offsets), but this function must still never panic
         // on hostile/misordered input.
-        let residents = [resident_at(0x400), resident_at(0x100)];
-        let bounds = module_boundaries(&residents, 0x1000);
+        let residents = [resident_at(0x400, 0), resident_at(0x100, 0)];
+        let bounds = module_boundaries(&residents, 0x1000, Some(BASE));
         assert_eq!(bounds.len(), 2);
         assert_eq!(bounds[0].start, 0x400);
         assert_eq!(bounds[0].end_upper_bound, 0x100);
         assert_eq!(bounds[1].start, 0x100);
         assert_eq!(bounds[1].end_upper_bound, 0x1000);
+    }
+
+    #[test]
+    fn end_skip_hint_none_without_base_addr() {
+        let residents = [resident_at(0x100, BASE + 0x200)];
+        let bounds = module_boundaries(&residents, 0x1000, None);
+        assert_eq!(bounds[0].end_skip_hint, None);
+    }
+
+    #[test]
+    fn end_skip_hint_reported_when_strictly_inside_bound() {
+        // end_skip translates to offset 0x200, strictly inside (0x100, 0x300].
+        let residents = [resident_at(0x100, BASE + 0x200), resident_at(0x300, 0)];
+        let bounds = module_boundaries(&residents, 0x1000, Some(BASE));
+        assert_eq!(bounds[0].end_skip_hint, Some(0x200));
+    }
+
+    #[test]
+    fn end_skip_hint_none_when_equal_to_upper_bound() {
+        // The conventional case: end_skip names exactly the next module's
+        // start, so there's no tightening beyond what's already known.
+        let residents = [resident_at(0x100, BASE + 0x300), resident_at(0x300, 0)];
+        let bounds = module_boundaries(&residents, 0x1000, Some(BASE));
+        assert_eq!(bounds[0].end_skip_hint, None);
+    }
+
+    #[test]
+    fn end_skip_hint_none_when_outside_safe_range() {
+        // Hostile/corrupt end_skip values: before this module's own
+        // start, at/after the upper bound, and wildly out of ROM range.
+        // None of these may ever be reported as a hint.
+        let before_start = [resident_at(0x200, BASE + 0x100), resident_at(0x300, 0)];
+        assert_eq!(
+            module_boundaries(&before_start, 0x1000, Some(BASE))[0].end_skip_hint,
+            None
+        );
+
+        let past_upper_bound = [resident_at(0x100, BASE + 0x400), resident_at(0x300, 0)];
+        assert_eq!(
+            module_boundaries(&past_upper_bound, 0x1000, Some(BASE))[0].end_skip_hint,
+            None
+        );
+
+        let garbage = [resident_at(0x100, 0xFFFF_FFFF), resident_at(0x300, 0)];
+        assert_eq!(
+            module_boundaries(&garbage, 0x1000, Some(BASE))[0].end_skip_hint,
+            None
+        );
+    }
+
+    #[test]
+    fn end_skip_hint_handles_wrapping_translation_without_panicking() {
+        // end_skip below base_addr wraps rather than underflowing/panicking
+        // (same convention as resolve_resident_str); the wrapped result is
+        // huge, so it's outside the safe range and reported as None.
+        let residents = [resident_at(0x100, 0), resident_at(0x300, 0)];
+        let bounds = module_boundaries(&residents, 0x1000, Some(BASE));
+        assert_eq!(bounds[0].end_skip_hint, None);
     }
 }
 

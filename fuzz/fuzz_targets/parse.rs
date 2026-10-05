@@ -57,12 +57,15 @@
 //!   derived from the input's own bytes (see `patches_from_input`
 //!   below), covering in-bounds, out-of-bounds, `usize`-overflowing,
 //!   and mismatched-length patches against a mutable copy of `data`.
-//! * `module_boundaries(&residents, rom_len)` — `residents` collected
-//!   from `rom.scan()` (so whatever hits/none this input produces),
-//!   `rom_len` the input's own length; `scan()` always yields ascending
-//!   offsets, so this harness never reaches the out-of-order path (the
-//!   dedicated unit test covers that), but still proves the in-order
-//!   path stays panic-free on adversarial scan results.
+//! * `module_boundaries(&residents, rom_len, rom.base_addr())` —
+//!   `residents` collected from `rom.scan()` (so whatever hits/none this
+//!   input produces), `rom_len` the input's own length, and the same
+//!   `base_addr` the scan itself used (so `end_skip_hint`'s translation
+//!   is exercised too); `scan()` always yields ascending offsets, so
+//!   this harness never reaches the out-of-order path (the dedicated
+//!   unit test covers that), but still proves the in-order path stays
+//!   panic-free on adversarial scan results and adversarial `end_skip`
+//!   values.
 //! * `find_relocations(a, b, delta)` — the input split in half (front/
 //!   back, same halving convention as `combine`) as the two buffers,
 //!   with `delta` derived from the input's own bytes so both zero and
@@ -229,7 +232,7 @@ fuzz_target!(|data: &[u8]| {
 
     // --- module_boundaries: whatever residents this input scans to -----
     let residents: Vec<_> = rom.scan().collect();
-    let _ = module_boundaries(&residents, data.len());
+    let _ = module_boundaries(&residents, data.len(), rom.base_addr());
 
     // --- find_relocations: split input in half, delta from the bytes ---
     let mid = data.len() / 2;
