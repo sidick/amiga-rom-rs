@@ -57,11 +57,21 @@
 //!   derived from the input's own bytes (see `patches_from_input`
 //!   below), covering in-bounds, out-of-bounds, `usize`-overflowing,
 //!   and mismatched-length patches against a mutable copy of `data`.
+//! * `module_boundaries(&residents, rom_len)` — `residents` collected
+//!   from `rom.scan()` (so whatever hits/none this input produces),
+//!   `rom_len` the input's own length; `scan()` always yields ascending
+//!   offsets, so this harness never reaches the out-of-order path (the
+//!   dedicated unit test covers that), but still proves the in-order
+//!   path stays panic-free on adversarial scan results.
+//! * `find_relocations(a, b, delta)` — the input split in half (front/
+//!   back, same halving convention as `combine`) as the two buffers,
+//!   with `delta` derived from the input's own bytes so both zero and
+//!   non-zero deltas are reached.
 #![no_main]
 
 use amiga_rom::{
-    apply_patches, combine, merge_hi_lo, seal_checksum, split, split_hi_lo, KickRom, Loader,
-    ModuleSpec, PatchOp,
+    apply_patches, combine, find_relocations, merge_hi_lo, module_boundaries, seal_checksum,
+    split, split_hi_lo, KickRom, Loader, ModuleSpec, PatchOp,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -216,4 +226,14 @@ fuzz_target!(|data: &[u8]| {
     let mut patch_target = data.to_vec();
     let patches = patches_from_input(data);
     let _ = apply_patches(&mut patch_target, &patches);
+
+    // --- module_boundaries: whatever residents this input scans to -----
+    let residents: Vec<_> = rom.scan().collect();
+    let _ = module_boundaries(&residents, data.len());
+
+    // --- find_relocations: split input in half, delta from the bytes ---
+    let mid = data.len() / 2;
+    let (reloc_a, reloc_b) = data.split_at(mid);
+    let delta = usize_at(data, 0) as u32;
+    let _ = find_relocations(reloc_a, reloc_b, delta);
 });

@@ -66,6 +66,40 @@ with a 4-byte KickSum header (matching what `amiga-rom` computes for
 free) followed by a dense, delta-encoded relocation-offset stream, not
 full 32-bit addresses. Format observed, not reused.
 
+**Further independent elaboration of that same delta encoding**, found
+post-0.4.0 at <http://capitoline.twocatsblack.com/index.php/skick-rtb/>
+(a third party's own description of the on-disk `.RTB`/`.PAT` shape for
+interoperability with `skick`, including that page's own public-domain
+example C validator — not Troller's restricted docs, read only as a
+black-box format description, same discipline as the SKick 346 check
+above): each reloc position is stored as a *delta* from the previous
+one — a single byte if `<256`, else a `0x00` sentinel byte followed by
+a word-aligned big-endian 2-byte delta (forcing the stream to stay
+word-aligned, inserting a padding `0x00` when needed) — terminated by
+four zero bytes, with an optional second section (flagged by
+`0xFFFFFFFF`) for the early `dos.library`'s BCPL-style relocs (stored
+×4 smaller, BCPL's own addressing convention), itself terminated by
+four zero bytes. `.PAT` files are simpler: a checksum header followed
+by `(offset, 4 replacement bytes)` pairs, zero-terminated — i.e.
+exactly this crate's own `PatchOp`/`apply_patches` shape (milestone 5),
+independently corroborating that design rather than suggesting a
+change to it. Still format observed, not reused — milestone 6 is where
+an independent *generator* for this kind of data, if ever attempted,
+would live, not here.
+
+**Methodology note for milestone 6**, from the same site's
+`analysing-unknown-roms` page: two techniques for identifying module
+boundaries and RELOCs without restricted data — (1) scanning for
+`RTC_MATCHWORD` and cross-referencing a self-built database of known
+modules by CRC32 (their own "hash file" scheme), and (2) finding RELOCs
+by diffing two ROMs that contain the *same* library loaded at two
+*different* addresses — any byte position that differs, at the same
+relative offset within the library, and by exactly the address delta
+between the two ROMs' load points, must be a RELOC. Both are
+independently derivable from first principles (no restricted-data
+access implied); worth revisiting when milestone 6 is actually
+attempted.
+
 Given both: **don't bundle any of this.** When split/build (milestone 4)
 is tackled, the catalog loads from a **pluggable format the user
 supplies**, not shipped in the crate. Emailing Doobrey and/or
@@ -378,6 +412,46 @@ Ordered so each item's tests exist before or with it.
       split→merge round-trip property test; `LoaderError` variants
       for size mismatches settled (`MismatchedHiLoLength` exists;
       likely add odd-size / not-a-ROM-size).
+- [x] **ReKick/ReCode and KickIt container formats** — new item, added
+      post-0.4.0 after a reader pointed at
+      <http://capitoline.twocatsblack.com/>, a hobbyist Kickstart
+      editing tool's documentation site (plain HTTP only — fetch with
+      `curl`, not `WebFetch`, which force-upgrades to `https://` and
+      gets `ECONNREFUSED`). Two more raw-dump containers, both decoded
+      key-free so they slot into `Loader::detect`/`normalize` the same
+      way the byte-order permutations do (unlike Cloanto, which needs a
+      caller-supplied key). Full facts, with the explicit caveat that
+      this rests on a single secondary source (not oracle-verified, no
+      real sample file available to this project):
+      `docs/research/rekick-kickit-facts.md`.
+      - **`RomEncoding::ReKickEncoded`** ("DEADFEED" format): a
+        108-byte plaintext header (the same copyright-banner text
+        confirmed at a different offset in milestone 1's Cloanto
+        research) precedes a self-keyed chained-XOR payload — block 0
+        XORed against the fixed constant `0xDEADFEED`, every later
+        block XORed against the *previous block's decoded plaintext*.
+        `Loader::detect` matches a stable prefix of the banner (not
+        the full 108 bytes, since the copyright year range varies by
+        ROM revision) and requires the remaining length to be exactly
+        256 KiB or 512 KiB before classifying — `decode_rekick` then
+        unconditionally succeeds (no key, no error variant needed).
+      - **`RomEncoding::KickItWrapped`**: a trivial 8-byte header (four
+        zero bytes, then a big-endian size) wrapping an
+        already-canonical softloaded image (used for non-MMU machines
+        loading a Kickstart to a non-standard RAM address). Detected
+        only when the declared size is exactly 256 KiB/512 KiB and
+        matches the actual remaining length; `normalize` just strips
+        the 8 bytes.
+      - **Deliberately not done**: no encode direction for either
+        (same reasoning as Cloanto — this crate reads real dumps, it
+        doesn't produce distributable ReKick/KickIt files), and no
+        attempt to generalize beyond the one documented header
+        length/shape of each — a different real-world variant is a
+        reason to extend this item, not to guess ahead of evidence.
+      - 6 new unit tests (detect/reject/round-trip for both formats);
+        covered by the existing fuzz target automatically, since it
+        already calls `Loader::detect`/`normalize` on arbitrary bytes
+        — no fuzz-target code change needed for the new branches.
 - [x] **Error shape audit.** `LoaderError::NotYetImplemented` is
       deleted (it exists only to keep stubs honest); remaining
       variants reviewed against "every failure a caller can act on
@@ -809,6 +883,77 @@ anchor before reaching for heuristics.
   Doobrey/Troller material (see the licensing section up top), and
   that caution should carry through here.
 
+**Progress, 2026-10-05 — research + partial implementation, not
+complete.** Full design brief:
+`docs/research/module-boundary-detection.md`. Per that document's own
+header, nothing in it or in the code below came from opening or
+searching for Doobrey's or Troller's restricted files.
+
+- [x] **Module start offsets confirmed as already solved.** Re-read
+      milestone 3's own doc comments specifically for this: `Resident
+      ::offset` (already on the type) *is* the start offset, free,
+      no new API needed. Honestly scoped what it does *not* cover
+      (code with no `Resident` structure at all) — see the design
+      doc §2.
+- [x] **`module_boundaries`** — a new, safe (non-heuristic) primitive:
+      given a sorted list of `Resident` hits and the image length,
+      returns one `ModuleBoundary{start, end_upper_bound}` per resident,
+      where `end_upper_bound` is the next resident's start (or
+      `rom_len` for the last one). This is a **true upper bound, not a
+      claimed real end** — documented as such everywhere it appears,
+      because the module's actual last byte can be, and usually is,
+      earlier (alignment padding, shared glue code). 4 unit tests
+      (`boundary_tests`), including an out-of-order-input case proving
+      it never panics even outside its documented precondition. Added
+      to the fuzz target.
+- [ ] **Tighter end-offset detection — explicitly NOT done.** Three
+      candidate heuristics (padding/alignment stripping, code/data
+      entropy classification, disassemble-until-RTS) were considered
+      and rejected for this pass — see design doc §3 for the reasoning
+      per heuristic. None met this crate's own bar (oracle-verified or
+      NDK-cited) for being shipped as more than a guess. Open for a
+      future session; `module_boundaries`' honest upper bound is what
+      ships instead.
+- [x] **`find_relocations`** — generic two-buffer RELOC-diff primitive
+      implementing the technique already recorded above (same code at
+      two load addresses, diff for words that shifted by exactly the
+      base delta). Deliberately **not** ROM-specific — takes two
+      arbitrary equal-length `&[u8]` and a `u32` delta, returns
+      `Vec<RelocCandidate>`; `RelocDiffError::LengthMismatch` on
+      mismatched lengths. Scans every 2-byte-aligned offset, matching
+      `ResidentScan`'s own word-alignment convention. 7 unit tests
+      (`reloc_tests`) with synthetic planted-relocation fixtures
+      (never real ROM bytes) covering: a single planted reloc, multiple
+      relocs, zero matches on identical buffers with nonzero delta, the
+      documented `delta == 0` degenerate case, odd-offset exclusion,
+      length mismatch, and empty buffers. Added to the fuzz target.
+      Failure modes (coincidental false positives, BCPL-scaled false
+      negatives, table-aliasing) documented in design doc §4.3 rather
+      than silently assumed away.
+- [ ] **Using `find_relocations` on real modules — not attempted.**
+      Needs two real same-build Kickstart ROMs loaded at different
+      bases and a way to line up "the same module" in both; neither
+      exists in this crate's test suite by design (no real ROM bytes
+      ship here). If ever done, follows the `AMIGA_ROM_DIR` discipline:
+      local-only, never committed, never used to "correct" the
+      algorithm.
+- [ ] **CRC32/known-module hash-file identification** (Capitoline's
+      other named technique) — not designed or implemented this
+      session. See design doc §5.
+- [ ] **BCPL-scaled (`delta / 4`) second pass for early `dos.library`
+      relocs** — not implemented; no confirmed, general rule yet for
+      exactly which regions need it (see design doc §4.3).
+- [ ] **Catalog-assembly layer** (turning `module_boundaries` +
+      `find_relocations` into anything resembling a `romtool
+      split`-equivalent generator) — not started, and gated on the
+      still-open end-offset problem above. The two primitives shipped
+      this session are deliberately just that: primitives, same
+      "mechanism, not data" discipline as `apply_patches`/`combine`.
+
+This milestone remains open. What shipped this session is real,
+tested, and honestly scoped — not a claim that module-boundary
+detection is solved.
+
 ## Cross-cutting
 
 - [x] **Panic policy**: after milestone 2, no public entry point may
@@ -829,6 +974,58 @@ anchor before reaching for heuristics.
 - [x] **crates.io**: published `amiga-rom` 0.2.0 (2026-09-15, tag
       `v0.2.0`); 0.x thereafter until the milestone-4 interfaces prove
       out.
+
+## Backlog — additional ideas (research session 2026-10-05)
+
+Surfaced while reading maidavale.org's ROM-hacking roundup and then
+Capitoline's own site in detail (http://capitoline.twocatsblack.com/),
+specifically the `1mb-roms`, `superkick`, `skick-rtb`, `patcher`,
+`hash-files`, `analysing-unknown-roms`, `structure`, `digital` and
+`physical` pages — same site already cited above for the `.RTB`/`.PAT`
+format description and the milestone-6 identification methodology.
+Recorded here, not acted on yet except where noted.
+
+- **Milestone 6 is already in progress** — see the dedicated section
+  above; this session dispatched a research worker against it
+  (2026-10-05), under the same legal discipline already written there
+  (ROM bytes + public conventions only, never Doobrey's/Troller's
+  restricted files, real-ROM comparisons private/local-only).
+- **skick/RTB *encoder*.** The plan above only treats the `.RTB` delta
+  format as something to *understand* (for milestone-6 context and as
+  independent corroboration of the `PatchOp` shape). Actually
+  generating `.RTB` files (softload Kickstart support, also usable by
+  WHDLoad) is new scope, and depends on milestone 6's RELOC data
+  existing first — a pure byte-level encoder, so it belongs in this
+  crate, not the CLI. Not started.
+- **SuperKickstart / A1000 `KICK` boot-floppy container formats.**
+  Two more non-ADF, non-filesystem floppy containers directly relevant
+  to a Kickstart-ROM crate: the A1000's 8k-bootstrap `KICK`-prefixed
+  floppy (raw 256k ROM starting at byte 512) and the A3000-targeted
+  `KICKSUP0`-prefixed SuperKickstart floppy (fixed-offset Kickstart +
+  "Bonus" code pair, two revisions). Candidates for new `RomEncoding`
+  variants/detection, same shape as the already-implemented
+  Cloanto/ReKick/KickIt containers. Not started; no decision yet on
+  whether floppy-sector-level containers belong in this crate (bytes
+  in, bytes out — arguably in scope) or are better left to a
+  disk-image-aware consumer.
+- **SCANTABLE-derived 1MB/2MB patch data.** Milestone 5 shipped the
+  `apply_patches` mechanism but deliberately deferred shipping the
+  `1mb_rom` named patch's actual bytes/offsets as "real
+  reverse-engineering work in its own right." Capitoline's `1mb-roms`
+  page documents the SCANTABLE patching technique (locate the
+  SCANTABLE via a byte search anchored on exec.library's own
+  `RT_ENDSKIP` field, append a replacement table sized for 1MB/2MB,
+  repoint the `LEA`-relative reference) for KS1.3, KS2.x, KS3.1, and
+  Hyperion 3.1.4+ ROMs — independently derivable the same way the
+  byte-order/header facts above were (ROM's own structure + public
+  68k/Amiga conventions, no restricted catalog needed). A candidate
+  source for finally deriving `1mb_rom` (and a `2mb_rom` sibling)
+  properly. Not started.
+- **PAT file format — no action needed.** Capitoline's `.PAT` format
+  (checksum header + zero-terminated `(offset, 4 replacement bytes)`
+  records) was already confirmed, in this same plan, to be exactly
+  this crate's existing `PatchOp`/`apply_patches` shape. Noted here
+  only to close the loop — nothing new to do.
 
 ## Non-goals, so they don't creep in
 

@@ -10,10 +10,11 @@
 //! Two layers:
 //!
 //! - [`Loader`] turns whatever bytes a user actually has — byte-swapped,
-//!   [Cloanto/Amiga Forever-encoded](RomEncoding::CloantoEncoded), or a
-//!   split hi/lo EPROM pair ([`merge_hi_lo`]/[`split_hi_lo`]) — into a
-//!   canonical raw image. These need `alloc`, since they own the output
-//!   buffer.
+//!   [Cloanto/Amiga Forever-encoded](RomEncoding::CloantoEncoded),
+//!   [ReKick/ReCode-encoded](RomEncoding::ReKickEncoded),
+//!   [KickIt-wrapped](RomEncoding::KickItWrapped), or a split hi/lo
+//!   EPROM pair ([`merge_hi_lo`]/[`split_hi_lo`]) — into a canonical raw
+//!   image. These need `alloc`, since they own the output buffer.
 //! - [`KickRom`] inspects/validates a canonical image: allocation-free,
 //!   borrowing the caller's `&[u8]`.
 //!
@@ -52,7 +53,22 @@
 //! images) and the patch mechanism ([`apply_patches`]/[`PatchOp`]):
 //! generic find/verify/replace over a ROM buffer, with no actual patch
 //! data (e.g. `1mb_rom`) shipped — see those items' doc comments and
-//! `PLAN.md`'s "Milestone 5" section.
+//! `PLAN.md`'s "Milestone 5" section. Post-0.4.0, the loader also
+//! recognizes and decodes two more container formats discovered via
+//! independent research (Capitoline's Kickstart documentation):
+//! [`RomEncoding::ReKickEncoded`] (the "DEADFEED" chained-XOR format)
+//! and [`RomEncoding::KickItWrapped`] (a trivial zero/size header) —
+//! see `PLAN.md`'s milestone-2 "ReKick/ReCode and KickIt" item.
+//! Milestone 6 (independent module-boundary detection, deliberately
+//! last) is research-in-progress: see
+//! `docs/research/module-boundary-detection.md` for the full design and
+//! `PLAN.md`'s Milestone 6 section for status. Two primitives have
+//! landed so far: [`module_boundaries`] (a safe, non-heuristic upper
+//! bound on each [`Resident`]'s extent, derived from already-trusted
+//! scan offsets) and [`find_relocations`] (a generic two-buffer RELOC
+//! detector for the "same code at two different load addresses"
+//! technique). Tighter end-offset detection and any catalog-assembly
+//! layer remain open.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -72,6 +88,32 @@ pub const ROM_SIZE_512K: usize = 512 * 1024;
 /// footer). Confirmed against real Amiga Forever ROMs and
 /// AmigaROMUtil (MIT) — see `docs/research/cloanto-hilo-facts.md`.
 const CLOANTO_MAGIC: &[u8] = b"AMIROMTYPE1";
+
+/// ReKick/ReCode's fixed 108-byte plaintext header, preceding the
+/// "DEADFEED"-chained-XOR-encrypted Kickstart payload. The magic here is
+/// a stable prefix of that header's text (the copyright banner also
+/// found inside the decoded Kickstart payload itself) — deliberately
+/// shorter than the full 108 bytes, since the year range in the full
+/// text varies by ROM revision. Independently described (not ported from
+/// any restricted tool) at
+/// <http://capitoline.twocatsblack.com/index.php/digital/>; cross-checked
+/// against that source's own hash-file example, which places the
+/// Kickstart payload starting at container offset 108 — see PLAN.md's
+/// milestone-2 ReKick/KickIt item.
+const REKICK_MAGIC: &[u8] = b"AMIGA ROM Operating System and Libraries: Copyright";
+/// Length of the ReKick/ReCode plaintext header preceding the encrypted
+/// payload.
+const REKICK_HEADER_LEN: usize = 108;
+/// The fixed initial XOR key for ReKick/ReCode's chained-block cipher
+/// (see [`decode_rekick`]).
+const REKICK_INITIAL_KEY: [u8; 4] = [0xDE, 0xAD, 0xFE, 0xED];
+
+/// KickIt's fixed 8-byte header: four zero bytes followed by a
+/// big-endian `u32` giving the softloaded Kickstart image's size in
+/// bytes (conventionally [`ROM_SIZE_512K`]). Independently described at
+/// <http://capitoline.twocatsblack.com/index.php/digital/> — see
+/// PLAN.md's milestone-2 ReKick/KickIt item.
+const KICKIT_HEADER_LEN: usize = 8;
 
 /// Byte order of a raw ROM dump relative to the canonical big-endian
 /// layout. Real dumps show up in all four of these, depending on the
@@ -98,6 +140,14 @@ pub enum RomEncoding {
     /// Cloanto/Amiga Forever's XOR-encoded container. [`Loader::normalize`]
     /// needs a `rom.key` to decode this.
     CloantoEncoded,
+    /// ReKick/ReCode's "DEADFEED"-encrypted container: a 108-byte
+    /// plaintext header followed by a self-keyed chained-XOR payload.
+    /// No key is required — [`Loader::normalize`] decodes this directly.
+    ReKickEncoded,
+    /// KickIt's container: a fixed 8-byte header (four zero bytes, then
+    /// a big-endian size) wrapping an otherwise-canonical softloaded
+    /// image. No key is required.
+    KickItWrapped,
 }
 
 /// Errors from [`Loader`] and the hi/lo split/merge functions.
@@ -207,14 +257,20 @@ pub struct Loader;
 impl Loader {
     /// Inspects leading bytes against known boot-vector signatures under
     /// all four [`ByteOrder`] permutations (plus the Cloanto
-    /// `AMIROMTYPE1` container magic), and classifies. Does not
-    /// decode/reorder — see [`Loader::normalize`] for that.
+    /// `AMIROMTYPE1` container magic, the ReKick/ReCode plaintext-header
+    /// magic, and KickIt's zero-prefixed size header), and classifies.
+    /// Does not decode/reorder — see [`Loader::normalize`] for that.
     ///
     /// Returns `None` when `data` doesn't match anything recognized —
     /// too short (fewer than 8 bytes, unless it matches the Cloanto
     /// magic, which only needs its own 11 bytes), or its first longword
     /// doesn't match the boot-vector signature table under any
-    /// permutation.
+    /// permutation. The ReKick/KickIt containers are only classified
+    /// when their declared/implied payload length is exactly
+    /// [`ROM_SIZE_256K`] or [`ROM_SIZE_512K`] — anything else falls
+    /// through to the raw boot-vector check (and likely `None`), rather
+    /// than reporting a container match [`Loader::normalize`] can't
+    /// actually decode.
     ///
     /// Matching proceeds: for each table entry and each permutation,
     /// compare the image's raw first big-endian `u32` against the
@@ -234,6 +290,21 @@ impl Loader {
     pub fn detect(data: &[u8]) -> Option<RomEncoding> {
         if data.starts_with(CLOANTO_MAGIC) {
             return Some(RomEncoding::CloantoEncoded);
+        }
+        if data.starts_with(REKICK_MAGIC) {
+            if let Some(payload_len) = data.len().checked_sub(REKICK_HEADER_LEN) {
+                if matches!(payload_len, ROM_SIZE_256K | ROM_SIZE_512K) {
+                    return Some(RomEncoding::ReKickEncoded);
+                }
+            }
+        }
+        if data.len() >= KICKIT_HEADER_LEN && data[0..4] == [0, 0, 0, 0] {
+            let size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            if matches!(size, ROM_SIZE_256K | ROM_SIZE_512K)
+                && data.len() - KICKIT_HEADER_LEN == size
+            {
+                return Some(RomEncoding::KickItWrapped);
+            }
         }
         if data.len() < 8 {
             return None;
@@ -272,6 +343,8 @@ impl Loader {
                 let key = key.ok_or(LoaderError::KeyRequired)?;
                 decode_cloanto(data, key)
             }
+            Some(RomEncoding::ReKickEncoded) => Ok(decode_rekick(&data[REKICK_HEADER_LEN..])),
+            Some(RomEncoding::KickItWrapped) => Ok(data[KICKIT_HEADER_LEN..].to_vec()),
             Some(RomEncoding::Raw(ByteOrder::Normal)) => Ok(data.to_vec()),
             Some(RomEncoding::Raw(order)) => {
                 if data.len() % 4 != 0 {
@@ -305,6 +378,37 @@ fn decode_cloanto(data: &[u8], key: &[u8]) -> Result<Vec<u8>, LoaderError> {
         out.push(b ^ key[i % key.len()]);
     }
     Ok(out)
+}
+
+/// Decodes a ReKick/ReCode "DEADFEED" payload (the bytes after the
+/// container's [`REKICK_HEADER_LEN`]-byte plaintext header): a
+/// self-keyed chained XOR over 4-byte blocks. The first block is XORed
+/// against the fixed constant [`REKICK_INITIAL_KEY`] (`0xDEADFEED`);
+/// every subsequent block is XORed against the *previous block's
+/// decoded plaintext* — not against the keystream, so decoding is a
+/// strictly sequential fold, each step's output feeding the next step's
+/// key. No separate encode direction exists in this crate (same
+/// reasoning as Cloanto: callers only ever need to read real dumps).
+///
+/// `payload.len()` is always a whole multiple of 4 here — [`Loader::detect`]
+/// only classifies a [`RomEncoding::ReKickEncoded`] container when the
+/// payload length is exactly [`ROM_SIZE_256K`] or [`ROM_SIZE_512K`], both
+/// multiples of 4 — so [`core::slice::ChunksExact`] never leaves a
+/// remainder to silently drop.
+fn decode_rekick(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len());
+    let mut key = REKICK_INITIAL_KEY;
+    for chunk in payload.chunks_exact(4) {
+        let block = [
+            chunk[0] ^ key[0],
+            chunk[1] ^ key[1],
+            chunk[2] ^ key[2],
+            chunk[3] ^ key[3],
+        ];
+        out.extend_from_slice(&block);
+        key = block;
+    }
+    out
 }
 
 /// Merges two same-size hi/lo EPROM dumps into one canonical image: for
@@ -1915,6 +2019,162 @@ pub fn apply_patches(rom: &mut [u8], patches: &[PatchOp]) -> Result<(), PatchErr
     Ok(())
 }
 
+/// A conservative upper bound on one [`Resident`] module's extent,
+/// derived purely from [`ResidentScan`]'s already-trustworthy start
+/// offsets — see `docs/research/module-boundary-detection.md` §3 and
+/// `PLAN.md`'s Milestone 6 for why this is a *bound*, not the module's
+/// real (tighter) end: `rt_EndSkip` is deliberately never trusted (per
+/// milestone 3), and nothing else in a linked ROM self-announces where a
+/// module's own bytes actually stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleBoundary {
+    /// The module's start offset — identical to the originating
+    /// [`Resident::offset`].
+    pub start: usize,
+    /// Exclusive upper bound on the module's end: the next resident's
+    /// start offset, or the image length for the last module. The
+    /// module's real extent satisfies `start <= real_end <=
+    /// end_upper_bound`; this crate does not claim `end_upper_bound`
+    /// itself is the real end.
+    pub end_upper_bound: usize,
+}
+
+/// Derives [`ModuleBoundary`] upper bounds from a list of [`Resident`]
+/// hits, one per resident.
+///
+/// `residents` must be sorted ascending by [`Resident::offset`] — exactly
+/// the order [`KickRom::scan`] yields them in, since [`ResidentScan`]
+/// only ever advances forward through the image. Out-of-order input is
+/// not rejected (this function never panics), but the resulting bounds
+/// are only meaningful for sorted input; garbage in, garbage (but never
+/// a panic or an out-of-bounds value) out.
+///
+/// A module's end can never run past the next resident's own
+/// `rt_MatchWord`, because that word must remain intact in ROM for
+/// `exec.library`'s own boot-time scan to find it — so this bound is
+/// always safe, never wrong, only potentially loose (real Kickstart ROMs
+/// commonly have alignment padding or non-resident glue code between one
+/// module's actual last byte and the next module's start, which this
+/// function has no way to see).
+pub fn module_boundaries(residents: &[Resident], rom_len: usize) -> Vec<ModuleBoundary> {
+    let mut out = Vec::with_capacity(residents.len());
+    for (i, resident) in residents.iter().enumerate() {
+        let end_upper_bound = residents.get(i + 1).map_or(rom_len, |next| next.offset);
+        out.push(ModuleBoundary {
+            start: resident.offset,
+            end_upper_bound,
+        });
+    }
+    out
+}
+
+/// One RELOC candidate found by [`find_relocations`]: at `offset` (a
+/// byte offset into both compared buffers), the big-endian `u32` word in
+/// the first buffer plus the caller's `delta` (wrapping) equals the
+/// corresponding word in the second buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelocCandidate {
+    /// Byte offset of the candidate word, in both `a` and `b`.
+    pub offset: usize,
+}
+
+/// Errors from [`find_relocations`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocDiffError {
+    /// `a` and `b` were not the same length. The two-ROM-diff technique
+    /// only makes sense comparing the *same* code at two different base
+    /// addresses, which must therefore be the same size.
+    LengthMismatch {
+        /// `a.len()`.
+        a_len: usize,
+        /// `b.len()`.
+        b_len: usize,
+    },
+}
+
+impl fmt::Display for RelocDiffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelocDiffError::LengthMismatch { a_len, b_len } => {
+                write!(
+                    f,
+                    "find_relocations: buffers have different lengths ({} vs {})",
+                    a_len, b_len
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RelocDiffError {}
+
+/// Generic two-buffer RELOC-finding primitive: the independent technique
+/// recorded in `PLAN.md`'s Milestone 6 section (originally Capitoline's
+/// `analysing-unknown-roms` methodology page, read only for this
+/// technique, never for any restricted catalog data) for finding
+/// relocatable absolute addresses by diffing the *same* code loaded at
+/// two different base addresses.
+///
+/// Not ROM-specific — this is a plain "find words that shifted by a
+/// known delta between two equal-length buffers" scan; nothing here
+/// reads [`KickRom`] or [`Resident`] state. A caller wanting to apply it
+/// to two Kickstart ROMs excises the same module from each (e.g. via
+/// [`split`] or by hand) and supplies those two slices here, along with
+/// the known difference between the two ROMs' load/base addresses.
+///
+/// # Algorithm
+///
+/// Every 2-byte-aligned offset is checked — matching [`ResidentScan`]'s
+/// own convention, since m68k instructions and their longword operands
+/// are only ever word-aligned. At each offset, if
+/// `u32::from_be_bytes(a[offset..offset+4]).wrapping_add(delta) ==
+/// u32::from_be_bytes(b[offset..offset+4])`, that offset is reported as
+/// a [`RelocCandidate`]. `delta` is `b`'s base address minus `a`'s,
+/// wrapping per `u32` arithmetic (consistent with [`ResidentScan`]'s own
+/// `base_addr` math).
+///
+/// # Failure modes (see `docs/research/module-boundary-detection.md` §4.3
+/// for the full writeup)
+///
+/// This is a raw candidate list, not a verified relocation table:
+/// coincidental word matches unrelated to any real address are reported
+/// as false positives (more likely the "rounder"/smaller `delta` is
+/// relative to the data's entropy); `delta == 0` degenerately matches
+/// every unchanged word in both buffers; scaled/BCPL-style relocations
+/// (stored at 1/4 scale by early `dos.library` code, per `PLAN.md`'s
+/// `.RTB` format research) are not caught by a direct `delta` comparison
+/// and would need a separate pass with `delta / 4`. No clustering or
+/// deduplication is performed — same "ship the mechanism, not a
+/// catalog" discipline as [`apply_patches`].
+///
+/// # Errors
+///
+/// [`RelocDiffError::LengthMismatch`] if `a.len() != b.len()`.
+pub fn find_relocations(
+    a: &[u8],
+    b: &[u8],
+    delta: u32,
+) -> Result<Vec<RelocCandidate>, RelocDiffError> {
+    if a.len() != b.len() {
+        return Err(RelocDiffError::LengthMismatch {
+            a_len: a.len(),
+            b_len: b.len(),
+        });
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset + 4 <= a.len() {
+        let a_word = u32::from_be_bytes([a[offset], a[offset + 1], a[offset + 2], a[offset + 3]]);
+        let b_word = u32::from_be_bytes([b[offset], b[offset + 1], b[offset + 2], b[offset + 3]]);
+        if a_word.wrapping_add(delta) == b_word {
+            out.push(RelocCandidate { offset });
+        }
+        offset += 2;
+    }
+    Ok(out)
+}
+
 /// Test-only synthetic Kickstart image fixtures — never ships real ROM
 /// bytes (see `PLAN.md`'s "ROM images themselves" section). Builds a
 /// minimal valid canonical image encoding exactly the milestone-1 facts
@@ -2291,6 +2551,77 @@ mod tests {
             Loader::normalize(&data, None),
             Err(LoaderError::KeyRequired)
         );
+    }
+
+    /// Builds a synthetic ReKick/ReCode container: the plaintext header
+    /// (padded with zeroes out to [`REKICK_HEADER_LEN`]) followed by
+    /// `plain` encrypted per [`decode_rekick`]'s chained-XOR scheme
+    /// (self-inverse: encrypting is the same chain, since each step's
+    /// key is the *decoded* block, which during encryption is simply
+    /// the plaintext block being encoded).
+    fn rekick_container(plain: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; REKICK_HEADER_LEN];
+        data[..REKICK_MAGIC.len()].copy_from_slice(REKICK_MAGIC);
+        let mut key = REKICK_INITIAL_KEY;
+        for chunk in plain.chunks_exact(4) {
+            let cipher = [
+                chunk[0] ^ key[0],
+                chunk[1] ^ key[1],
+                chunk[2] ^ key[2],
+                chunk[3] ^ key[3],
+            ];
+            data.extend_from_slice(&cipher);
+            key = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        }
+        data
+    }
+
+    #[test]
+    fn detect_recognizes_rekick_magic() {
+        let plain = vec![0u8; ROM_SIZE_256K];
+        let data = rekick_container(&plain);
+        assert_eq!(Loader::detect(&data), Some(RomEncoding::ReKickEncoded));
+    }
+
+    #[test]
+    fn detect_rejects_rekick_magic_with_wrong_payload_length() {
+        let plain = vec![0u8; ROM_SIZE_256K + 4];
+        let data = rekick_container(&plain);
+        assert_ne!(Loader::detect(&data), Some(RomEncoding::ReKickEncoded));
+    }
+
+    #[test]
+    fn normalize_decodes_rekick_payload() {
+        let plain = synthetic_rom(RomFixtureParams::new_256k());
+        let data = rekick_container(&plain);
+        let decoded = Loader::normalize(&data, None).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn detect_recognizes_kickit_header() {
+        let mut data = vec![0u8; KICKIT_HEADER_LEN];
+        data[4..8].copy_from_slice(&(ROM_SIZE_512K as u32).to_be_bytes());
+        data.extend_from_slice(&[0xAAu8; ROM_SIZE_512K]);
+        assert_eq!(Loader::detect(&data), Some(RomEncoding::KickItWrapped));
+    }
+
+    #[test]
+    fn detect_rejects_kickit_header_with_mismatched_length() {
+        let mut data = vec![0u8; KICKIT_HEADER_LEN];
+        data[4..8].copy_from_slice(&(ROM_SIZE_512K as u32).to_be_bytes());
+        data.extend_from_slice(&[0xAAu8; ROM_SIZE_256K]);
+        assert_ne!(Loader::detect(&data), Some(RomEncoding::KickItWrapped));
+    }
+
+    #[test]
+    fn normalize_strips_kickit_header() {
+        let plain = synthetic_rom(RomFixtureParams::new_512k());
+        let mut data = vec![0u8; KICKIT_HEADER_LEN];
+        data[4..8].copy_from_slice(&(ROM_SIZE_512K as u32).to_be_bytes());
+        data.extend_from_slice(&plain);
+        let normalized = Loader::normalize(&data, None).unwrap();
+        assert_eq!(normalized, plain);
     }
 
     #[test]
@@ -3529,5 +3860,192 @@ mod patch_tests {
             rom, original,
             "no patch may apply when any patch in the list fails verification"
         );
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Builds a minimal `Resident` with only `offset` populated — the
+    /// only field [`module_boundaries`] reads — leaving every other
+    /// field at an arbitrary-but-valid default.
+    fn resident_at(offset: usize) -> Resident<'static> {
+        Resident {
+            match_word: RTC_MATCHWORD,
+            flags: 0,
+            version: 0,
+            node_type: 0,
+            priority: 0,
+            name: b"",
+            id_string: b"",
+            init_addr: 0,
+            offset,
+            end_skip: 0,
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_no_boundaries() {
+        assert_eq!(module_boundaries(&[], 0x1000), vec![]);
+    }
+
+    #[test]
+    fn single_resident_bounded_by_rom_len() {
+        let residents = [resident_at(0x100)];
+        assert_eq!(
+            module_boundaries(&residents, 0x1000),
+            vec![ModuleBoundary {
+                start: 0x100,
+                end_upper_bound: 0x1000,
+            }]
+        );
+    }
+
+    #[test]
+    fn consecutive_residents_bound_each_other() {
+        let residents = [resident_at(0x100), resident_at(0x300), resident_at(0x400)];
+        assert_eq!(
+            module_boundaries(&residents, 0x1000),
+            vec![
+                ModuleBoundary {
+                    start: 0x100,
+                    end_upper_bound: 0x300,
+                },
+                ModuleBoundary {
+                    start: 0x300,
+                    end_upper_bound: 0x400,
+                },
+                ModuleBoundary {
+                    start: 0x400,
+                    end_upper_bound: 0x1000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn out_of_order_input_never_panics() {
+        // Not the documented precondition (ResidentScan always yields
+        // ascending offsets), but this function must still never panic
+        // on hostile/misordered input.
+        let residents = [resident_at(0x400), resident_at(0x100)];
+        let bounds = module_boundaries(&residents, 0x1000);
+        assert_eq!(bounds.len(), 2);
+        assert_eq!(bounds[0].start, 0x400);
+        assert_eq!(bounds[0].end_upper_bound, 0x100);
+        assert_eq!(bounds[1].start, 0x100);
+        assert_eq!(bounds[1].end_upper_bound, 0x1000);
+    }
+}
+
+#[cfg(test)]
+mod reloc_tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Builds a buffer of `len` bytes filled with a repeating
+    /// non-relocation-looking pattern, then plants one absolute-address
+    /// word at `offset` with value `addr`.
+    fn buf_with_word(len: usize, offset: usize, addr: u32) -> Vec<u8> {
+        let mut v: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        v[offset..offset + 4].copy_from_slice(&addr.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn length_mismatch_is_rejected() {
+        let a = vec![0u8; 16];
+        let b = vec![0u8; 12];
+        assert_eq!(
+            find_relocations(&a, &b, 0x1000),
+            Err(RelocDiffError::LengthMismatch {
+                a_len: 16,
+                b_len: 12
+            })
+        );
+    }
+
+    #[test]
+    fn single_planted_relocation_is_found() {
+        let delta: u32 = 0x0004_0000;
+        let addr_a: u32 = 0x00F8_1234;
+        let a = buf_with_word(64, 32, addr_a);
+        let b = buf_with_word(64, 32, addr_a.wrapping_add(delta));
+        let hits = find_relocations(&a, &b, delta).unwrap();
+        assert_eq!(hits, vec![RelocCandidate { offset: 32 }]);
+    }
+
+    #[test]
+    fn identical_buffers_with_nonzero_delta_find_nothing() {
+        let a = buf_with_word(64, 32, 0x00F8_1234);
+        let b = a.clone();
+        let hits = find_relocations(&a, &b, 0x1000).unwrap();
+        assert_eq!(hits, vec![]);
+    }
+
+    #[test]
+    fn zero_delta_degenerately_matches_every_identical_word() {
+        // Documented degenerate case: delta == 0 means "equal words
+        // match", which floods the result on identical buffers. This
+        // test pins that documented behavior rather than silently
+        // special-casing it away.
+        let a = buf_with_word(8, 0, 0x1111_1111);
+        let b = a.clone();
+        let hits = find_relocations(&a, &b, 0).unwrap();
+        assert_eq!(
+            hits,
+            vec![
+                RelocCandidate { offset: 0 },
+                RelocCandidate { offset: 2 },
+                RelocCandidate { offset: 4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_planted_relocations_all_found() {
+        let delta: u32 = 0x0002_0000;
+        let mut a: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
+        let mut b = a.clone();
+        let addrs = [
+            (8usize, 0x00F8_0000u32),
+            (40, 0x00F8_1000),
+            (100, 0x00F8_2000),
+        ];
+        for &(off, addr) in &addrs {
+            a[off..off + 4].copy_from_slice(&addr.to_be_bytes());
+            b[off..off + 4].copy_from_slice(&addr.wrapping_add(delta).to_be_bytes());
+        }
+        let hits = find_relocations(&a, &b, delta).unwrap();
+        assert_eq!(
+            hits,
+            vec![
+                RelocCandidate { offset: 8 },
+                RelocCandidate { offset: 40 },
+                RelocCandidate { offset: 100 },
+            ]
+        );
+    }
+
+    #[test]
+    fn odd_offsets_are_never_checked() {
+        // A "relocation-shaped" match that only lines up at an
+        // odd/unaligned offset must not be reported — m68k absolute
+        // long operands are always word-aligned.
+        let delta: u32 = 0x0001_0000;
+        let addr_a: u32 = 0x00F8_0000;
+        let mut a = vec![0u8; 16];
+        let mut b = vec![0u8; 16];
+        a[3..7].copy_from_slice(&addr_a.to_be_bytes());
+        b[3..7].copy_from_slice(&addr_a.wrapping_add(delta).to_be_bytes());
+        let hits = find_relocations(&a, &b, delta).unwrap();
+        assert_eq!(hits, vec![]);
+    }
+
+    #[test]
+    fn empty_buffers_find_nothing() {
+        assert_eq!(find_relocations(&[], &[], 0x1234).unwrap(), vec![]);
     }
 }

@@ -49,10 +49,15 @@ Milestones 1–5 are complete:
 
 Verified throughout via a differential harness against `romtool`, a
 sweep of real ROM dumps, and 40M+ fuzz executions with zero crashes.
-See [PLAN.md](PLAN.md) for what's next: independently deriving
-module-boundary data without the restricted Remus/Romsplit catalog
-(milestone 6, deliberately last — a research problem, not a quick
-implementation).
+
+Milestone 6 (independently deriving module-boundary data without the
+restricted Remus/Romsplit catalog — deliberately last, a research
+problem rather than a quick implementation) is in progress. See
+[`docs/research/module-boundary-detection.md`](docs/research/module-boundary-detection.md)
+for the design and `PLAN.md` for status. Two primitives have landed so
+far — `module_boundaries` (a safe upper bound on each resident module's
+extent) and `find_relocations` (a generic two-buffer RELOC detector) —
+with tighter end-offset detection and catalog assembly still open.
 
 ## Example
 

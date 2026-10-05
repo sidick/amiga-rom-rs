@@ -7,7 +7,7 @@ edition = "2021"
 # packaging. Raising it is a semver-visible decision, not an accident.
 rust-version = "1.63"
 license = "MIT OR Apache-2.0"
-description = "Amiga Kickstart ROM images: inspect, normalize (byte-order, Cloanto-encoded, hi/lo EPROM split), validate"
+description = "Amiga Kickstart ROM images: inspect, normalize (byte-order, Cloanto/ReKick/KickIt-encoded, hi/lo EPROM split), validate"
 repository = "https://github.com/sidick/amiga-rom-rs"
 keywords = ["amiga", "kickstart", "rom", "retrocomputing"]
 categories = ["no-std", "parser-implementations", "emulators"]
