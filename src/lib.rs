@@ -78,6 +78,7 @@
 //! catalog-assembly layer remain open.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![deny(missing_docs)]
 
 extern crate alloc;
 
@@ -1391,22 +1392,36 @@ pub const KNOWN_ROMS: &[KnownRom<'static>] = &[
 /// too short to contain that field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RomInfo {
+    /// `true` iff [`KickRom::check_size`].
     pub size_ok: bool,
+    /// `true` iff [`KickRom::check_header`].
     pub header_ok: bool,
+    /// `true` iff [`KickRom::check_footer`].
     pub footer_ok: bool,
+    /// `true` iff [`KickRom::check_size_field`].
     pub size_field_ok: bool,
+    /// `true` iff [`KickRom::verify_check_sum`].
     pub chk_sum_ok: bool,
+    /// `true` iff [`KickRom::check_kickety_split`].
     pub kickety_split_ok: bool,
     /// `true` iff [`KickRom::check_doubled`] — the image's two 256 KiB
     /// halves are byte-for-byte identical. Not a `romtool info` field;
     /// see that method's doc comment.
     pub doubled_ok: bool,
+    /// `true` iff [`KickRom::check_magic_reset`].
     pub magic_reset_ok: bool,
+    /// `true` iff [`KickRom::is_kick_rom`] — the overall validity
+    /// conjunction.
     pub is_kick: bool,
+    /// [`KickRom::read_check_sum`]'s value.
     pub check_sum: Option<u32>,
+    /// [`KickRom::base_addr`]'s value.
     pub base_addr: Option<u32>,
+    /// [`KickRom::boot_pc`]'s value.
     pub boot_pc: Option<u32>,
+    /// [`KickRom::rom_rev`]'s value.
     pub rom_rev: Option<(u16, u16)>,
+    /// [`KickRom::exec_rev`]'s value.
     pub exec_rev: Option<(u16, u16)>,
 }
 
@@ -1460,15 +1475,30 @@ const RESIDENT_STRING_SEARCH_CAP: usize = 256;
 /// caller's problem if they choose to use it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resident<'a> {
+    /// `rt_MatchWord` — always `RTC_MATCHWORD` (`0x4AFC`) on a valid
+    /// hit.
     pub match_word: u16,
+    /// `rt_Flags` — see `RTF_*` in `exec/resident.h` (e.g.
+    /// `RTF_AUTOINIT`, bit 7).
     pub flags: u8,
+    /// `rt_Version`.
     pub version: u8,
+    /// `rt_Type` — `NT_LIBRARY`/`NT_DEVICE`/`NT_RESOURCE`/etc., see
+    /// `exec/nodes.h`.
     pub node_type: u8,
+    /// `rt_Pri` — signed initialization priority.
     pub priority: i8,
+    /// `rt_Name`, resolved — see the struct's doc comment for the
+    /// empty-slice/validity rules.
     pub name: &'a [u8],
+    /// `rt_IdString`, resolved — same rules as [`Resident::name`].
     pub id_string: &'a [u8],
+    /// `rt_Init` — meaning depends on `RTF_AUTOINIT` in [`Resident::flags`].
     pub init_addr: u32,
+    /// Byte offset in the image where `rt_MatchWord` was found — see
+    /// the struct's doc comment for why this isn't an NDK field.
     pub offset: usize,
+    /// `rt_EndSkip`, raw and untrusted — see the struct's doc comment.
     pub end_skip: u32,
 }
 

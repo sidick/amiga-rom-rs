@@ -1032,8 +1032,20 @@ detection is solved.
       `-D warnings`, `fmt --check`, `RUSTDOCFLAGS="-D warnings"
       doc`, MSRV 1.63 job, amitools differential job (pins the
       version), 60-second fuzz smoke once the fuzz target exists.
-- [ ] **`#![deny(missing_docs)]`** once milestone 2's API-shape
-      audit settles signatures (before publish).
+- [x] **`#![deny(missing_docs)]`** — added. Surfaced 23 undocumented
+      struct fields on two types whose *struct-level* doc comments
+      already described every field in prose/table form but never
+      carried a `///` on the field itself: `RomInfo` (13 fields, mostly
+      one-liners pointing at the `KickRom` method each mirrors) and
+      `Resident` (10 fields, already named in the struct doc's
+      offset/field table — field docs here are deliberately short,
+      cross-referencing that table rather than repeating it). One
+      rustdoc-link fix needed alongside: `Resident::match_word`'s new
+      doc comment couldn't use an intra-doc link to the private
+      `RTC_MATCHWORD` const (`-D rustdoc::private_intra_doc_links`
+      under `RUSTDOCFLAGS="-D warnings"`), so it spells out the value
+      (`0x4AFC`) in plain text instead. No functional change; full
+      suite/clippy/fmt/rustdoc/no_std/MSRV/fuzz-build all still pass.
 - [x] **Real-ROM harness**: the `AMIGA_ROM_DIR` env-gated test
       module (skips silently when unset), asserting known facts
       about known ROMs by KickSum. Local-only, never CI.
